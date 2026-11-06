@@ -54,7 +54,7 @@ class Settings(BaseSettings):
     head_pose_max_yaw_deg: float = 55.0
     min_ear_width: float = 0.012
 
-    playwright_headless: bool = True
+    playwright_headless: bool = False
     viewport_width: int = 1280
     viewport_height: int = 720
     navigation_timeout_ms: int = 45000

@@ -11,7 +11,7 @@ from app.core.config import Settings
 from app.core.logging import log_event
 from app.core.security import secret_registry
 from app.models.application import Application
-from app.schemas.application import ApplicationValidateResponse, CheckItem
+from app.schemas.application import ApplicationValidateResponse, CatalogCategory, CatalogResponse, CheckItem
 
 
 def validate_url(url: str) -> None:
@@ -103,38 +103,57 @@ class BrowserService:
             checks.append(CheckItem(name="login", ok=True, detail="Login successful."))
             await adapter.launch()
             loaded = True
-            checks.append(CheckItem(name="loaded", ok=True, detail="Try-on application loaded."))
-            jewelry = await adapter.catalog_earring_names()
+            checks.append(
+                CheckItem(
+                    name="loaded",
+                    ok=True,
+                    detail="Try-on page opened with the face video as the camera.",
+                )
+            )
+            # Keep Video mode active so the camera feed is ready for jewelry testing.
+            await adapter.browser.wait_for_timeout(1500)
+            catalog = await _read_catalog(adapter)
+            jewelry = [name for group in catalog for name in group.items]
             if not jewelry:
                 checks.append(
-                    CheckItem(name="catalog", ok=False, detail="The try-on catalog did not list any earrings.")
+                    CheckItem(name="catalog", ok=False, detail="The try-on catalog did not list any jewelry.")
                 )
                 return ApplicationValidateResponse(
                     status="failed",
                     reachable=True,
                     login_successful=True,
                     application_loaded=True,
-                    message="The try-on opened, but no catalog earrings were available to choose.",
+                    message="The try-on opened, but no catalog jewelry was available to choose.",
                     checks=checks,
                 )
             checks.append(
-                CheckItem(name="catalog", ok=True, detail=f"{len(jewelry)} catalog earrings are ready to test.")
+                CheckItem(name="catalog", ok=True, detail=f"{len(jewelry)} catalog pieces are ready to choose.")
             )
+            # Catalog reading may close a storefront modal; reopen so the camera view is ready.
+            if await adapter._is_storefront():
+                await adapter._open_storefront_tryon()
+                await adapter._wait_for_canvas(timeout_ms=30000)
             try:
                 await adapter.browser.screenshot(shot)
                 screenshot = str(shot)
             except Exception:
-                screenshot = None
+                try:
+                    page = adapter.browser._require_page()
+                    await page.screenshot(path=str(shot))
+                    screenshot = str(shot)
+                except Exception:
+                    screenshot = None
             log_event("APPLICATION_VALIDATED", url=url, jewelry=len(jewelry))
             return ApplicationValidateResponse(
                 status="success",
                 reachable=True,
                 login_successful=True,
                 application_loaded=True,
-                message="Try-on is open. Choose the earring to test on the girl in the video.",
+                message="Try-on is open with the camera. Choose a catalog piece from the dropdown.",
                 checks=checks,
                 screenshot_url=screenshot,
                 jewelry=jewelry,
+                catalog=catalog,
             )
         except TryOnError as exc:
             if not reachable:
@@ -164,6 +183,73 @@ class BrowserService:
         finally:
             await adapter.close()
             secret_registry.discard(password)
+
+    async def list_catalog(
+        self,
+        *,
+        url: str,
+        username: str,
+        password: str,
+        video_path: str | None,
+    ) -> CatalogResponse:
+        """Open a try-on URL and return the jewelry names grouped by category."""
+        secret_registry.add(password)
+        try:
+            validate_url(url)
+        except TryOnError as exc:
+            return CatalogResponse(url=url, categories=[], message=str(exc))
+        face_video = Path(video_path) if video_path else None
+        if face_video is None or not face_video.is_file():
+            return CatalogResponse(
+                url=url,
+                categories=[],
+                message="Upload a video of the girl wearing no earrings, then load the catalog again.",
+            )
+        application = Application(
+            id="catalog",
+            name="catalog",
+            type="web",
+            url=url,
+            video_path=str(face_video),
+            username=username or None,
+        )
+        adapter = PlaywrightTryOnAdapter(
+            application,
+            username=username,
+            password=password,
+            output_dir=self.settings.data_dir / "applications" / "validation",
+            fps=1,
+            duration_seconds=1,
+            headless=self.settings.playwright_headless,
+            viewport_width=self.settings.viewport_width,
+            viewport_height=self.settings.viewport_height,
+            timeout_ms=self.settings.navigation_timeout_ms,
+        )
+        try:
+            await adapter.connect()
+            await adapter.authenticate()
+            await adapter.launch()
+            categories = await _read_catalog(adapter)
+            if not categories:
+                return CatalogResponse(url=url, categories=[], message="The try-on URL did not list any jewelry.")
+            return CatalogResponse(url=url, categories=categories, message="")
+        except TryOnError as exc:
+            return CatalogResponse(url=url, categories=[], message=str(exc))
+        except Exception as exc:
+            detail = secret_registry.redact(str(exc)).strip() or exc.__class__.__name__
+            return CatalogResponse(url=url, categories=[], message=f"Browser automation failed: {detail}")
+        finally:
+            await adapter.close()
+            secret_registry.discard(password)
+
+
+async def _read_catalog(adapter: PlaywrightTryOnAdapter) -> list[CatalogCategory]:
+    grouped = await adapter.catalog_by_category()
+    if not grouped:
+        names = await adapter.catalog_earring_names()
+        if names:
+            grouped = [{"category": "Earrings", "items": names}]
+    return [CatalogCategory.model_validate(group) for group in grouped]
 
 
 def _failed(checks: list[CheckItem], message: str) -> ApplicationValidateResponse:

@@ -46,8 +46,17 @@ class ApplicationUpdate(BaseModel):
     username: str | None = None
 
 
+class TryOnForm(BaseModel):
+    """Blank try-on form. Saved applications are not copied into these fields."""
+
+    name: str = ""
+    url: str = ""
+    username: str = ""
+
+
 class ApplicationValidateRequest(BaseModel):
     url: str
+    name: str | None = None
     username: str = ""
     password: str = ""
     type: ApplicationType = "web"
@@ -64,6 +73,24 @@ class CheckItem(BaseModel):
     detail: str
 
 
+class CatalogCategory(BaseModel):
+    category: str
+    items: list[str] = []
+
+
+class CatalogRequest(BaseModel):
+    url: str
+    username: str = ""
+    password: str = ""
+    application_id: str | None = None
+
+
+class CatalogResponse(BaseModel):
+    url: str
+    categories: list[CatalogCategory] = []
+    message: str = ""
+
+
 class ApplicationValidateResponse(BaseModel):
     status: Literal["success", "failed"]
     reachable: bool
@@ -74,6 +101,7 @@ class ApplicationValidateResponse(BaseModel):
     screenshot_url: str | None = None
     application_id: str | None = None
     jewelry: list[str] = []
+    catalog: list[CatalogCategory] = []
 
 
 class TargetDescriptor(BaseModel):

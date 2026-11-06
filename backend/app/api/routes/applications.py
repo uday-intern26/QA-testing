@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
@@ -12,6 +13,9 @@ from app.schemas.application import (
     ApplicationUpdate,
     ApplicationValidateRequest,
     ApplicationValidateResponse,
+    CatalogRequest,
+    CatalogResponse,
+    TryOnForm,
 )
 from app.services.application_service import ApplicationService
 from app.services.browser_service import BrowserService
@@ -25,6 +29,12 @@ def list_applications(session: Session = Depends(get_db)) -> list[ApplicationRea
     return [ApplicationRead.model_validate(item, from_attributes=True) for item in ApplicationService().list(session)]
 
 
+@router.get("/form", response_model=TryOnForm)
+def blank_tryon_form() -> TryOnForm:
+    """The try-on name and link start empty. A saved application is used only after it is chosen."""
+    return TryOnForm()
+
+
 @router.post("", response_model=ApplicationRead, status_code=201)
 def create_application(payload: ApplicationCreate, session: Session = Depends(get_db)) -> ApplicationRead:
     try:
@@ -32,6 +42,24 @@ def create_application(payload: ApplicationCreate, session: Session = Depends(ge
     except ValueError as exc:
         raise HTTPException(status_code=422, detail={"code": "INVALID_APPLICATION", "message": str(exc)}) from exc
     return ApplicationRead.model_validate(record, from_attributes=True)
+
+
+@router.post("/catalog", response_model=CatalogResponse)
+async def list_tryon_catalog(
+    payload: CatalogRequest,
+    session: Session = Depends(get_db),
+    settings: Settings = Depends(get_app_settings),
+) -> CatalogResponse:
+    """Return jewelry on a try-on URL, grouped as earrings, necklaces, bangles, rings, and bracelets."""
+    application = ApplicationService().get(session, payload.application_id) if payload.application_id else None
+    if payload.application_id and application is None:
+        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Application was not found."})
+    return await BrowserService(settings).list_catalog(
+        url=payload.url,
+        username=payload.username,
+        password=payload.password,
+        video_path=application.video_path if application else None,
+    )
 
 
 @router.post("/validate", response_model=ApplicationValidateResponse)
@@ -44,6 +72,14 @@ async def validate_application(
     application = service.get(session, payload.application_id) if payload.application_id else None
     if payload.application_id and application is None:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Application was not found."})
+    if application is not None:
+        if payload.name and payload.name.strip():
+            application.name = payload.name.strip()
+            application.updated_at = datetime.now(timezone.utc)
+            session.add(application)
+            session.commit()
+            session.refresh(application)
+        service.remember_url(application.id, payload.url)
     screenshot_dir = settings.data_dir / "applications" / "validation"
     result = await BrowserService(settings).validate(
         url=payload.url,
@@ -69,6 +105,14 @@ async def validate_application(
             message=result.message,
             screenshot=str(Path(screenshot_dir / Path(screenshot_url).name)) if screenshot_url else None,
         )
+        if result.status == "success":
+            application = service.save_passed_url(
+                session,
+                application,
+                payload.url,
+                payload.username,
+                name=payload.name or application.name,
+            )
         result.application_id = application.id
     return result
 
@@ -135,3 +179,18 @@ def get_application(application_id: str, session: Session = Depends(get_db)) -> 
     if record is None:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Application was not found."})
     return ApplicationRead.model_validate(record, from_attributes=True)
+
+
+@router.delete("/{application_id}", status_code=204)
+def delete_application(
+    application_id: str,
+    session: Session = Depends(get_db),
+    settings: Settings = Depends(get_app_settings),
+) -> None:
+    if not is_public_id(application_id):
+        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Application was not found."})
+    service = ApplicationService()
+    record = service.get(session, application_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Application was not found."})
+    service.delete(session, record, data_dir=settings.data_dir)

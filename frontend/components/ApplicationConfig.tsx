@@ -1,7 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { api, ApplicationRecord, ValidationResult } from "@/lib/api";
+import { useEffect, useRef, useState } from "react";
+import { api, ApplicationRecord, CatalogCategory, ValidationResult } from "@/lib/api";
 import { Card, Field, inputClass } from "./Shell";
 import { StatusBadge } from "./StatusBadge";
 
@@ -14,18 +14,19 @@ export function ApplicationConfig({
   selectedId?: string;
   listVersion?: number;
   onSelect?: (application: ApplicationRecord) => void;
-  onReady?: (application: ApplicationRecord, jewelry: string[], username: string, password: string) => void;
+  onReady?: (application: ApplicationRecord, catalog: CatalogCategory[]) => void;
 }) {
   const [items, setItems] = useState<ApplicationRecord[]>([]);
   const [name, setName] = useState("");
   const [url, setUrl] = useState("");
-  const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
   const [faceFile, setFaceFile] = useState<File | null>(null);
   const [savedVideo, setSavedVideo] = useState(false);
   const [validation, setValidation] = useState<ValidationResult | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [statusNote, setStatusNote] = useState("");
+  const openedKey = useRef("");
+  const busyRef = useRef(false);
 
   async function refresh() {
     const next = await api.applications();
@@ -39,12 +40,10 @@ export function ApplicationConfig({
       .then((form) => {
         setName(form.name || "");
         setUrl(form.url || "");
-        setUsername(form.username || "");
       })
       .catch(() => {
         setName("");
         setUrl("");
-        setUsername("");
       });
   }, []);
 
@@ -55,37 +54,44 @@ export function ApplicationConfig({
   function choose(item: ApplicationRecord) {
     setName(item.name);
     setUrl(item.url || "");
-    setUsername(item.username || "");
     setSavedVideo(Boolean(item.video_path));
     setValidation(null);
+    setStatusNote("");
+    openedKey.current = "";
     onSelect?.(item);
   }
 
-  async function onValidate() {
-    const trimmedName = name.trim();
+  async function openTryOn(force = false) {
+    const trimmedName = name.trim() || "AIJewel Amplify";
     const trimmedUrl = url.trim();
-    if (!trimmedName || !trimmedUrl || !username.trim() || !password) {
-      setError("Enter the name, try-on link, username, and password.");
+    if (!trimmedUrl) {
+      setError("Enter the try-on link.");
       return;
     }
     if (!faceFile && !savedVideo) {
-      setError("Upload a video of the girl wearing no earrings.");
+      setError("Upload a video of the girl wearing no earrings so the camera can turn on.");
       return;
     }
+    const key = `${trimmedUrl}|${faceFile?.name || "saved"}`;
+    if (!force && (busyRef.current || openedKey.current === key)) {
+      return;
+    }
+    busyRef.current = true;
+    openedKey.current = key;
     setBusy(true);
     setError("");
     setValidation(null);
+    setStatusNote("Opening the try-on page and turning on the camera…");
     try {
       let record = selectedId ? items.find((item) => item.id === selectedId) : undefined;
       if (!record) {
-        record = items.find((item) => item.name === trimmedName && item.url === trimmedUrl);
+        record = items.find((item) => item.url === trimmedUrl);
       }
       if (!record) {
         record = await api.createApplication({
           name: trimmedName,
           type: "web",
           url: trimmedUrl,
-          username: username.trim(),
         });
       }
       if (faceFile) {
@@ -98,8 +104,6 @@ export function ApplicationConfig({
       const result = await api.validateApplication({
         url: trimmedUrl,
         name: trimmedName,
-        username: username.trim(),
-        password,
         type: "web",
         application_id: record.id,
       });
@@ -112,14 +116,37 @@ export function ApplicationConfig({
           url: trimmedUrl,
         };
         onSelect?.(saved);
-        onReady?.(saved, result.jewelry || [], username.trim(), password);
+        const catalog = result.catalog?.length
+          ? result.catalog
+          : [{ category: "Earrings", items: result.jewelry || [] }];
+        onReady?.(saved, catalog);
+        setStatusNote("Try-on is open with the camera on. Choose the jewelry type and jewelry ID.");
+      } else {
+        openedKey.current = "";
+        setStatusNote("");
       }
     } catch (exc) {
-      setError(exc instanceof Error ? exc.message : "Validation failed");
+      openedKey.current = "";
+      setStatusNote("");
+      setError(exc instanceof Error ? exc.message : "Unable to open the try-on");
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   }
+
+  useEffect(() => {
+    const trimmedUrl = url.trim();
+    const ready = Boolean(trimmedUrl && (faceFile || savedVideo));
+    if (!ready || busyRef.current) return;
+    const key = `${trimmedUrl}|${faceFile?.name || "saved"}`;
+    if (openedKey.current === key) return;
+    const timer = window.setTimeout(() => {
+      void openTryOn(false);
+    }, 900);
+    return () => window.clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [url, faceFile, savedVideo]);
 
   return (
     <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_280px]">
@@ -139,19 +166,15 @@ export function ApplicationConfig({
               className={inputClass}
               placeholder="https://xxxxx.amplifyapp.com/try-on"
               value={url}
-              onChange={(event) => setUrl(event.target.value)}
-            />
-          </Field>
-          <Field label="Username">
-            <input className={inputClass} value={username} onChange={(event) => setUsername(event.target.value)} />
-          </Field>
-          <Field label="Password">
-            <input
-              className={inputClass}
-              type="password"
-              value={password}
-              autoComplete="off"
-              onChange={(event) => setPassword(event.target.value)}
+              onChange={(event) => {
+                openedKey.current = "";
+                setUrl(event.target.value);
+              }}
+              onBlur={() => {
+                if (url.trim() && (faceFile || savedVideo)) {
+                  void openTryOn(false);
+                }
+              }}
             />
           </Field>
           <Field label="Face video, no earrings">
@@ -160,25 +183,30 @@ export function ApplicationConfig({
               type="file"
               accept="video/mp4,video/webm,video/quicktime,.mp4,.webm,.mov"
               onChange={(event) => {
+                openedKey.current = "";
                 setFaceFile(event.target.files?.[0] || null);
                 setError("");
               }}
             />
             <p className="mt-1 text-xs text-zinc-500">
               {savedVideo
-                ? "A face video is already saved. Choose a new file only if you want to replace it."
-                : "This video is the camera. The chosen earring is placed on this girl."}
+                ? "A face video is already saved. When the try-on opens, this video is the camera."
+                : "This video becomes the try-on camera as soon as the page opens."}
             </p>
           </Field>
           <button
             type="button"
             disabled={busy}
-            onClick={onValidate}
+            onClick={() => void openTryOn(true)}
             className="rounded bg-zinc-100 px-4 py-2 text-sm font-medium text-zinc-950 disabled:opacity-50"
           >
-            {busy ? "Validating try-on…" : "Validate Application"}
+            {busy ? "Opening try-on & camera…" : "Open try-on & camera"}
           </button>
-          <p className="text-xs text-zinc-500">The password is used for this validation and the placement test. It is not saved.</p>
+          <p className="text-xs text-zinc-500">
+            After you enter the try-on link and face video, the try-on page opens automatically with the
+            camera on.
+          </p>
+          {statusNote ? <p className="text-sm text-sky-300">{statusNote}</p> : null}
           {error ? <p className="text-sm text-red-400">{error}</p> : null}
           {validation ? (
             <div className="space-y-1 text-sm">
@@ -186,11 +214,8 @@ export function ApplicationConfig({
               <p className={validation.reachable ? "text-emerald-400" : "text-red-400"}>
                 {validation.reachable ? "✓" : "✗"} Application reachable
               </p>
-              <p className={validation.login_successful ? "text-emerald-400" : "text-red-400"}>
-                {validation.login_successful ? "✓" : "✗"} Login successful
-              </p>
               <p className={validation.application_loaded ? "text-emerald-400" : "text-red-400"}>
-                {validation.application_loaded ? "✓" : "✗"} Try-on application loaded
+                {validation.application_loaded ? "✓" : "✗"} Try-on opened with camera
               </p>
               <p className="text-zinc-400">{validation.message}</p>
               {validation.screenshot_url ? (
@@ -203,11 +228,11 @@ export function ApplicationConfig({
       <Card title="Saved applications">
         <ul className="space-y-2">
           {items.filter((item) => item.url).map((item) => (
-            <li key={item.id}>
+            <li key={item.id} className="flex items-stretch gap-2">
               <button
                 type="button"
                 onClick={() => choose(item)}
-                className={`w-full rounded border px-3 py-2 text-left text-sm ${
+                className={`min-w-0 flex-1 rounded border px-3 py-2 text-left text-sm ${
                   selectedId === item.id ? "border-zinc-400" : "border-zinc-800"
                 }`}
               >
@@ -217,6 +242,29 @@ export function ApplicationConfig({
                   {item.id}
                   {item.video_path ? " · face video saved" : ""}
                 </span>
+              </button>
+              <button
+                type="button"
+                className="rounded border border-red-900 px-3 text-xs text-red-300 hover:bg-red-950"
+                onClick={async () => {
+                  if (!window.confirm(`Delete application ${item.name}? Related tests and runs will also be removed.`)) {
+                    return;
+                  }
+                  try {
+                    await api.deleteApplication(item.id);
+                    if (selectedId === item.id) {
+                      setName("");
+                      setUrl("");
+                      setSavedVideo(false);
+                      setValidation(null);
+                    }
+                    await refresh();
+                  } catch (exc) {
+                    setError(exc instanceof Error ? exc.message : "Delete failed");
+                  }
+                }}
+              >
+                Delete
               </button>
             </li>
           ))}

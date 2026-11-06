@@ -41,6 +41,7 @@ class FrameSelector:
         min_ear_width: float,
         minimum_confidence: float,
         ear_side: str,
+        require_ear_visibility: bool = True,
     ) -> None:
         self.min_blur_variance = min_blur_variance
         self.blur_norm_variance = blur_norm_variance
@@ -50,6 +51,7 @@ class FrameSelector:
         self.min_ear_width = min_ear_width
         self.minimum_confidence = minimum_confidence
         self.ear_side = ear_side
+        self.require_ear_visibility = require_ear_visibility
         self._ears = EarlobeAnchorEstimator()
 
     def extract_video(self, video_path: Path, target_fps: int, output_dir: Path) -> list[RawFrame]:
@@ -161,9 +163,10 @@ class FrameSelector:
                 reasons.append("face_occluded")
             left_visible = self._ears.visibility(face.landmarks, "left", self.min_ear_width)
             right_visible = self._ears.visibility(face.landmarks, "right", self.min_ear_width)
-            required = self._required_sides()
-            if any(side == "left" and not left_visible for side in required) or any(
-                side == "right" and not right_visible for side in required
+            required = self._required_sides() if self.require_ear_visibility else []
+            if required and (
+                any(side == "left" and not left_visible for side in required)
+                or any(side == "right" and not right_visible for side in required)
             ):
                 reasons.append("ear_not_visible")
             confidences = []
@@ -176,6 +179,8 @@ class FrameSelector:
                         confidences.append(0.0)
             if confidences:
                 confidence = min(confidences)
+            elif not self.require_ear_visibility:
+                confidence = float(face.confidence or 0.0)
             if confidence < self.minimum_confidence:
                 reasons.append("low_landmark_confidence")
 

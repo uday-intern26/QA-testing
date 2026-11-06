@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { api, ApplicationRecord, DashboardData, FrameRow, QaReport, RunStatus, TestRecord } from "@/lib/api";
+import { api, ApplicationRecord, CatalogCategory, DashboardData, FrameRow, QaReport, RunStatus, TestRecord } from "@/lib/api";
 import { ApplicationConfig } from "./ApplicationConfig";
 import { FrameViewer } from "./FrameViewer";
 import { PlacementResult } from "./PlacementResult";
@@ -11,16 +11,24 @@ import { Card, Field, inputClass } from "./Shell";
 import { TestLayers, layerStatus } from "./TestLayers";
 import { TestProgress } from "./TestProgress";
 
+const JEWELRY_TYPES = [
+  { value: "earring", category: "Earrings", label: "Earring" },
+  { value: "necklace", category: "Necklaces", label: "Necklace" },
+  { value: "bracelet", category: "Bracelets", label: "Bracelet" },
+  { value: "ring", category: "Rings", label: "Ring" },
+  { value: "bangle", category: "Bangles", label: "Bangle" },
+] as const;
+
 export function Workflow() {
   const [dashboard, setDashboard] = useState<DashboardData | null>(null);
   const [application, setApplication] = useState<ApplicationRecord | null>(null);
   const [test, setTest] = useState<TestRecord | null>(null);
-  const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
   const [savedListVersion, setSavedListVersion] = useState(0);
-  const [jewelry, setJewelry] = useState<string[]>([]);
+  const [catalog, setCatalog] = useState<CatalogCategory[]>([]);
+  const [jewelryType, setJewelryType] = useState<(typeof JEWELRY_TYPES)[number]["value"]>("earring");
   const [chosen, setChosen] = useState("");
   const [earSide, setEarSide] = useState<"left" | "right" | "both">("left");
+  const [selectedFinger, setSelectedFinger] = useState<"thumb" | "index" | "middle" | "ring" | "little">("ring");
   const [status, setStatus] = useState<RunStatus | null>(null);
   const [report, setReport] = useState<QaReport | null>(null);
   const [active, setActive] = useState<FrameRow | null>(null);
@@ -45,7 +53,6 @@ export function Workflow() {
           window.clearInterval(timer);
           setRunning(false);
           setSavedListVersion((version) => version + 1);
-          setPassword("");
           if (next.status === "completed") {
             const result = await api.results(test.id);
             setReport(result);
@@ -65,37 +72,57 @@ export function Workflow() {
     if (frameFilter === "all") return report.frames;
     return report.frames.filter((frame) => frame.status === frameFilter);
   }, [report, frameFilter]);
+  const availableTypes = useMemo(
+    () =>
+      JEWELRY_TYPES.filter((type) =>
+        catalog.some((group) => group.category === type.category && group.items.length > 0)
+      ),
+    [catalog]
+  );
+  const jewelryIds = useMemo(() => {
+    const category = JEWELRY_TYPES.find((type) => type.value === jewelryType)?.category;
+    return catalog.find((group) => group.category === category)?.items || [];
+  }, [catalog, jewelryType]);
+
+  function selectJewelryType(nextType: (typeof JEWELRY_TYPES)[number]["value"]) {
+    setJewelryType(nextType);
+    const category = JEWELRY_TYPES.find((type) => type.value === nextType)?.category;
+    const items = catalog.find((group) => group.category === category)?.items || [];
+    setChosen(items[0] || "");
+  }
 
   async function runTest() {
     if (!application || !chosen) {
-      setError("Validate the try-on, then choose the earring to test.");
-      return;
-    }
-    if (!password) {
-      setError("Enter the password and validate again before testing placement.");
+      setError("Validate the try-on, then choose the jewelry type and jewelry ID.");
       return;
     }
     setError("");
     setReport(null);
     try {
+      const earringDefaults = jewelryType === "earring";
+      const necklaceDefaults = jewelryType === "necklace";
+      const ringDefaults = jewelryType === "ring";
+      const braceletDefaults = jewelryType === "bracelet";
+      const bangleDefaults = jewelryType === "bangle";
       const created = await api.createTest({
-        name: `Earlobe placement · ${chosen}`,
+        name: `Placement · ${chosen}`,
         application_id: application.id,
         reference_id: null,
         jewelry_id: chosen,
-        jewelry_type: "earring",
-        ear_side: earSide,
-        capture_fps: 5,
+        jewelry_type: jewelryType,
+        ear_side: jewelryType === "earring" || jewelryType === "bracelet" || jewelryType === "bangle" || jewelryType === "ring" ? earSide : "left",
+        selected_finger: ringDefaults ? selectedFinger : null,
+        capture_fps: earringDefaults || necklaceDefaults || ringDefaults || braceletDefaults || bangleDefaults ? 10 : 5,
         capture_duration_seconds: 6,
-        minimum_confidence: 0.5,
-        pass_threshold: 0.1,
-        fail_threshold: 0.15,
+        minimum_confidence: earringDefaults || necklaceDefaults || ringDefaults || braceletDefaults || bangleDefaults ? 0.8 : 0.5,
+        pass_threshold: earringDefaults || ringDefaults || bangleDefaults ? 0.08 : 0.1,
+        fail_threshold: braceletDefaults ? 0.18 : 0.15,
         minimum_pass_rate: 0.95,
         maximum_consecutive_failures: 2,
       });
       setTest(created);
       setRunning(true);
-      await api.runTest(created.id, { username, password });
+      await api.runTest(created.id, {});
       setStatus(await api.status(created.id));
     } catch (exc) {
       setRunning(false);
@@ -119,12 +146,12 @@ export function Workflow() {
   return (
     <div className="space-y-8">
       <header>
-        <p className="text-xs uppercase tracking-[0.22em] text-zinc-500">AIJewel Try-On QA</p>
+        <p className="text-xs uppercase tracking-[0.22em] text-zinc-500">AIJewel QA · Try-On</p>
         <h2 className="mt-1 text-2xl font-semibold">Earring earlobe alignment</h2>
         <p className="mt-2 max-w-3xl text-sm text-zinc-400">
-          Enter the try-on link, username, password, and a video of the girl wearing no earrings. After
-          validation, choose a catalog earring. The result is PASS when that earring sits on her earlobe, and
-          FAIL otherwise.
+          Enter the try-on link and a face video. The try-on page opens automatically with that video as
+          the camera. Then choose jewelry type and jewelry ID. The result is PASS when the piece sits on
+          the body attachment point, and FAIL otherwise.
         </p>
       </header>
       {dashboard ? (
@@ -169,42 +196,84 @@ export function Workflow() {
           listVersion={savedListVersion}
           onSelect={(item) => {
             setApplication(item);
-            setUsername(item.username || username);
           }}
-          onReady={(item, names, login, secret) => {
+          onReady={(item, groups) => {
             setApplication(item);
-            setUsername(login);
-            setPassword(secret);
-            setJewelry(names);
-            setChosen(names[0] || "");
+            setCatalog(groups);
+            const firstType =
+              JEWELRY_TYPES.find((type) =>
+                groups.some((group) => group.category === type.category && group.items.length > 0)
+              ) || JEWELRY_TYPES[0];
+            setJewelryType(firstType.value);
+            setChosen(groups.find((group) => group.category === firstType.category)?.items[0] || "");
             setReport(null);
             setStatus(null);
           }}
         />
       </section>
 
-      {jewelry.length ? (
-        <Card title="Choose the earring to test" step="2">
+      {catalog.some((group) => group.items.length) ? (
+        <Card title="Choose the jewelry to test" step="2">
           <p className="mb-3 text-sm text-zinc-400">
-            The try-on catalog is open. Pick the earring that should sit on the girl in the video.
+            Select the jewelry type first. The jewelry ID list is filled from the try-on URL for that type.
           </p>
-          <div className="grid gap-3 md:grid-cols-2">
-            <Field label="Jewelry">
-              <select className={inputClass} value={chosen} onChange={(event) => setChosen(event.target.value)}>
-                {jewelry.map((name) => (
+          <div className="grid gap-3 md:grid-cols-3">
+            <Field label="Jewelry type">
+              <select
+                className={inputClass}
+                value={jewelryType}
+                onChange={(event) => selectJewelryType(event.target.value as typeof jewelryType)}
+              >
+                {(availableTypes.length ? availableTypes : JEWELRY_TYPES).map((type) => (
+                  <option key={type.value} value={type.value}>
+                    {type.label}
+                  </option>
+                ))}
+              </select>
+            </Field>
+            <Field label="Jewelry ID">
+              <select
+                className={inputClass}
+                value={chosen}
+                onChange={(event) => setChosen(event.target.value)}
+                disabled={!jewelryIds.length}
+              >
+                {!jewelryIds.length ? <option value="">No jewelry for this type</option> : null}
+                {jewelryIds.map((name) => (
                   <option key={name} value={name}>
                     {name}
                   </option>
                 ))}
               </select>
             </Field>
-            <Field label="Ear visible in the video">
-              <select className={inputClass} value={earSide} onChange={(event) => setEarSide(event.target.value as typeof earSide)}>
-                <option value="left">Left</option>
-                <option value="right">Right</option>
-                <option value="both">Both</option>
-              </select>
-            </Field>
+            {jewelryType === "earring" || jewelryType === "bracelet" || jewelryType === "bangle" || jewelryType === "ring" ? (
+              <Field label={jewelryType === "earring" ? "Ear visible in the video" : "Side visible in the video"}>
+                <select className={inputClass} value={earSide} onChange={(event) => setEarSide(event.target.value as typeof earSide)}>
+                  <option value="left">Left</option>
+                  <option value="right">Right</option>
+                  {jewelryType === "earring" ? <option value="both">Both</option> : null}
+                </select>
+              </Field>
+            ) : (
+              <Field label="Attachment check">
+                <input className={inputClass} value="Neck / chest placement" readOnly />
+              </Field>
+            )}
+            {jewelryType === "ring" ? (
+              <Field label="Selected finger">
+                <select
+                  className={inputClass}
+                  value={selectedFinger}
+                  onChange={(event) => setSelectedFinger(event.target.value as typeof selectedFinger)}
+                >
+                  <option value="thumb">Thumb</option>
+                  <option value="index">Index</option>
+                  <option value="middle">Middle</option>
+                  <option value="ring">Ring</option>
+                  <option value="little">Little</option>
+                </select>
+              </Field>
+            ) : null}
           </div>
           <button
             type="button"
@@ -212,7 +281,7 @@ export function Workflow() {
             disabled={running || !chosen}
             className="mt-4 rounded bg-zinc-100 px-6 py-3 text-base font-semibold text-zinc-950 disabled:opacity-50"
           >
-            {running ? "Testing placement…" : "Test this earring"}
+            {running ? "Testing placement…" : "Test this jewelry"}
           </button>
         {error ? <p className="mt-3 text-sm text-red-400">{error}</p> : null}
         {running && status?.preview_image_url ? (
@@ -311,14 +380,14 @@ function PlacementVerdict({ report }: { report: QaReport }) {
   const passed = report.overall_status === "PASS";
   return (
     <div className={`rounded-lg border p-6 text-center ${passed ? "border-emerald-500/40 bg-emerald-500/10" : "border-red-500/40 bg-red-500/10"}`}>
-      <p className="text-xs uppercase tracking-[0.2em] text-zinc-400">{report.jewelry_id || "Earring"}</p>
+      <p className="text-xs uppercase tracking-[0.2em] text-zinc-400">{report.jewelry_id || "Jewelry"}</p>
       <p className={`mt-2 text-4xl font-semibold ${passed ? "text-emerald-300" : "text-red-300"}`}>
         {passed ? "PASS" : "FAIL"}
       </p>
       <p className="mt-3 text-sm text-zinc-300">
         {passed
-          ? "The earring sits on the earlobe of the girl in the video."
-          : report.reason || "The earring does not sit on the earlobe."}
+          ? "The jewelry sits on the attachment point in the video."
+          : report.reason || "The jewelry does not sit on the attachment point."}
       </p>
     </div>
   );

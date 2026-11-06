@@ -11,6 +11,7 @@ class TestCreate(BaseModel):
     jewelry_id: str | None = None
     jewelry_type: Literal["earring", "necklace", "bracelet", "ring", "bangle"] = "earring"
     ear_side: Literal["left", "right", "both"] = "left"
+    selected_finger: Literal["thumb", "index", "middle", "ring", "little"] | None = "ring"
     capture_fps: Literal[1, 2, 5, 10] = 5
     capture_duration_seconds: float = Field(default=6, ge=1, le=60)
     minimum_confidence: float = Field(default=0.80, ge=0, le=1)
@@ -58,6 +59,7 @@ class TestStatusRead(BaseModel):
     error: str | None = None
     reason: str | None = None
     recommended_action: str | None = None
+    preview_image_url: str | None = None
 
 
 class ManualReviewRequest(BaseModel):

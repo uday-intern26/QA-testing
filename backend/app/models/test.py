@@ -16,6 +16,7 @@ class TestDefinition(SQLModel, table=True):
     jewelry_id: str | None = None
     jewelry_type: str = "earring"
     ear_side: str = "left"
+    selected_finger: str | None = "ring"
     capture_fps: int = 5
     capture_duration_seconds: float = 6.0
     minimum_confidence: float = 0.80

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import base64
 from abc import ABC, abstractmethod
 from pathlib import Path
+from urllib.parse import unquote_to_bytes
 
 
 class BrowserAdapter(ABC):
@@ -96,6 +98,7 @@ class PlaywrightBrowserAdapter(BrowserAdapter):
             launch_args.append("--use-fake-device-for-media-stream")
             launch_args.append(f"--use-file-for-fake-video-capture={camera}")
         self._browser = await self._playwright.chromium.launch(
+            channel="msedge",
             headless=self.headless,
             args=launch_args,
         )
@@ -110,6 +113,36 @@ class PlaywrightBrowserAdapter(BrowserAdapter):
     async def set_input_files(self, selector: str, path: Path) -> None:
         await self._require_page().locator(selector).set_input_files(str(path))
 
+    async def fetch_bytes(self, url: str) -> bytes | None:
+        """Download a catalog image. Page cookies are sent for http(s) URLs."""
+        if not url:
+            return None
+        if url.startswith("data:"):
+            return _decode_data_url(url)
+        if not url.startswith(("http://", "https://")):
+            return None
+        try:
+            response = await self._require_page().request.get(url, timeout=15000)
+            if not response.ok:
+                return None
+            body = await response.body()
+            return body or None
+        except Exception:
+            return None
+
+    async def screenshot_first(self, selector: str, path: Path) -> bool:
+        """Save a catalog thumbnail. A hidden thumbnail must not stop the test."""
+        try:
+            page = self._require_page()
+            locator = page.locator(selector).first
+            if await locator.count() == 0 or not await locator.is_visible():
+                return False
+            path.parent.mkdir(parents=True, exist_ok=True)
+            await locator.screenshot(path=str(path), timeout=3000, animations="disabled")
+            return True
+        except Exception:
+            return False
+
     async def screenshot_clip(self, path: Path, box: dict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         clip = {
@@ -119,6 +152,20 @@ class PlaywrightBrowserAdapter(BrowserAdapter):
             "height": max(1, float(box["height"])),
         }
         await self._require_page().screenshot(path=str(path), clip=clip)
+
+    async def tryon_box(self) -> dict | None:
+        locator = await self._tryon_viewport()
+        if locator is None:
+            return None
+        box = await locator.bounding_box()
+        if not box or box.get("width", 0) < 80 or box.get("height", 0) < 80:
+            return None
+        return {
+            "x": float(box["x"]),
+            "y": float(box["y"]),
+            "width": float(box["width"]),
+            "height": float(box["height"]),
+        }
 
     async def screenshot(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -146,7 +193,7 @@ class PlaywrightBrowserAdapter(BrowserAdapter):
             if not box or box.get("width", 0) < 80 or box.get("height", 0) < 80:
                 continue
             area = box["width"] * box["height"]
-            if "unity" in src or area > best_area:
+            if "unity" in src or "tryon" in src or "modal-frame" in (await handle.get_attribute("class") or "").lower() or area > best_area:
                 best = handle
                 best_area = area
         if best is not None:
@@ -211,3 +258,15 @@ class PlaywrightBrowserAdapter(BrowserAdapter):
         if self._page is None:
             raise RuntimeError("Browser is not started.")
         return self._page
+
+
+def _decode_data_url(url: str) -> bytes | None:
+    header, separator, payload = url.partition(",")
+    if not separator or not payload:
+        return None
+    try:
+        if ";base64" in header:
+            return base64.b64decode(payload, validate=False)
+        return unquote_to_bytes(payload)
+    except Exception:
+        return None

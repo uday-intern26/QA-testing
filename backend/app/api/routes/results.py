@@ -1,12 +1,14 @@
 import json
 from pathlib import Path
 
+import cv2
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from sqlmodel import Session, select
 
 from app.api.dependencies import get_app_settings, get_db
 from app.core.config import Settings
+from app.cv.visualization import composite_catalog_earring, draw_placed_earring
 from app.db.repositories import runs as run_repo
 from app.models.application import Application
 from app.models.frame import FrameResult
@@ -124,6 +126,28 @@ def list_runs(session: Session = Depends(get_db)) -> list[dict]:
     return payload
 
 
+@router.delete("/runs/{run_id}", status_code=204)
+def delete_run(
+    run_id: str,
+    session: Session = Depends(get_db),
+    settings: Settings = Depends(get_app_settings),
+) -> None:
+    run = run_repo.get_run(session, run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Run was not found."})
+    run_repo.delete_run(session, run, data_dir=settings.data_dir)
+
+
+@router.delete("/history", status_code=200)
+def clear_history(
+    session: Session = Depends(get_db),
+    settings: Settings = Depends(get_app_settings),
+) -> dict:
+    """Delete all test runs, results, and reports. Applications and test configs are kept."""
+    deleted = run_repo.delete_all_runs(session, data_dir=settings.data_dir)
+    return {"deleted_runs": deleted}
+
+
 @router.get("/tests/{test_id}/results")
 def test_results(
     test_id: str,
@@ -197,7 +221,26 @@ def frame_image(
     path = ensure_within_data(Path(raw))
     if not path.is_file():
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Frame image is missing."})
-    return FileResponse(path)
+    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if image is None:
+        return FileResponse(path)
+    for item in run_repo.results_for_frame(session, frame_id):
+        payload = json.loads(item.result_json or "{}")
+        anchor = (payload.get("earring") or {}).get("anchor") or payload.get("earring_anchor")
+        if not anchor or anchor.get("x") is None or anchor.get("y") is None:
+            continue
+        zone = payload.get("zone") or {}
+        ear = payload.get("ear") or {}
+        ear_width = zone.get("ear_width") or ear.get("ear_width")
+        sprite = Path(frame.path).resolve().parent.parent / "selected_earring.png"
+        if sprite.is_file():
+            image = composite_catalog_earring(image, sprite, float(anchor["x"]), float(anchor["y"]), ear_width)
+        else:
+            image = draw_placed_earring(image, float(anchor["x"]), float(anchor["y"]), ear_width)
+    encoded, buffer = cv2.imencode(".png", image)
+    if not encoded:
+        return FileResponse(path)
+    return Response(content=buffer.tobytes(), media_type="image/png", headers={"Cache-Control": "no-store"})
 
 
 @router.post("/tests/{test_id}/frames/{frame_id}/review")

@@ -30,6 +30,11 @@ from app.services.comparison_service import ComparisonService
 from app.services.earlobe_detector import EarlobeDetector
 from app.services.earring_detector import DebugStateEarringDetector, FallbackEarringAnchorDetector
 from app.services.frame_selector import FrameSelector, RawFrame, SelectedFrame
+from app.cv.earring_lay import aggregate_earring_lay, evaluate_earring_lay, measurement_from_earring_lay
+from app.cv.necklace_lay import aggregate_necklace_lay, evaluate_necklace_lay, measurement_from_necklace_lay
+from app.cv.bangle_lay import aggregate_bangle_lay, evaluate_bangle_lay, measurement_from_bangle_lay
+from app.cv.bracelet_lay import aggregate_bracelet_lay, evaluate_bracelet_lay, measurement_from_bracelet_lay
+from app.cv.ring_lay import aggregate_ring_lay, evaluate_ring_lay, measurement_from_ring_lay
 from app.services.placement_validator import validator_for
 from app.services.report_service import ReportService
 from app.services.temporal_validator import combine_statuses, summarize_temporal
@@ -70,6 +75,7 @@ class TestRunner:
             self._fail(run_id, exc)
             log_event("TEST_COMPLETED", test_run_id=run_id, status="failed")
         finally:
+            self._save_tested_application(run_id)
             if password:
                 secret_registry.discard(password)
 
@@ -82,13 +88,12 @@ class TestRunner:
             stored = session.get(Application, test.application_id)
             if stored is None:
                 raise TryOnError("The configured application no longer exists.", "APPLICATION_MISSING")
-            if test.jewelry_type != "earring":
-                raise TryOnError(
-                    f"Jewellery type '{test.jewelry_type}' is not implemented yet.",
-                    "JEWELRY_UNSUPPORTED",
-                    "Create the test with jewellery type earring. Other types have an extension point only.",
-                )
             application = Application.model_validate(stored.model_dump())
+            from app.services.application_service import ApplicationService
+
+            remembered = ApplicationService.validated_urls.get(application.id)
+            if remembered:
+                application.url = remembered
             output_dir = self.settings.data_dir / "results" / run.id
             output_dir.mkdir(parents=True, exist_ok=True)
             self._set_step(session, run, "application", "RUNNING", "Preparing application...", 5, status="running")
@@ -126,7 +131,14 @@ class TestRunner:
             note = await adapter.select_jewelry(jewelry_id)
             with session_scope() as session:
                 run = self._require_run(session, run_id)
-                self._set_step(session, run, "capture", "RUNNING", "Capturing frames...", 40)
+                self._set_step(
+                    session,
+                    run,
+                    "capture",
+                    "RUNNING",
+                    "Showing the selected jewelry on the live video. Pass or fail is decided after this.",
+                    40,
+                )
             frames, capture_note = await self.capture_service.capture(adapter, jewelry_id)
             del note
             video_path = getattr(adapter, "video_file", None)
@@ -142,12 +154,17 @@ class TestRunner:
                     session.commit()
             with session_scope() as session:
                 run = self._require_run(session, run_id)
+                overlay_note = (
+                    "Selected jewelry was shown on the live video. "
+                    if getattr(adapter, "live_overlay", None) and adapter.live_overlay.shown
+                    else ""
+                )
                 self._set_step(
                     session,
                     run,
                     "capture",
                     "PASS",
-                    f"{capture_note} Captured {len(frames)} frames.",
+                    f"{overlay_note}{capture_note} Captured {len(frames)} frames.",
                     55,
                 )
             log_event("CAPTURE_COMPLETED", test_run_id=run_id, frames=len(frames), url=app_url)
@@ -164,7 +181,15 @@ class TestRunner:
             reference_filename = reference.filename if reference else None
             reference_vector = self._vector_from_reference(reference)
             config = self._config(test)
-            sides = ["left", "right"] if test.ear_side == "both" else [test.ear_side]
+            jewelry_type = test.jewelry_type or "earring"
+            selected_finger = getattr(test, "selected_finger", None) or "ring"
+            config["selected_finger"] = selected_finger
+            if jewelry_type == "earring":
+                sides = ["left", "right"] if test.ear_side == "both" else [test.ear_side]
+            elif jewelry_type in {"bracelet", "bangle", "ring"} and test.ear_side in {"left", "right"}:
+                sides = [test.ear_side]
+            else:
+                sides = ["center"]
             test_id = test.id
             test_name = test.name
             jewelry_id = test.jewelry_id
@@ -187,7 +212,8 @@ class TestRunner:
             head_pose_max_yaw_deg=self.settings.head_pose_max_yaw_deg,
             min_ear_width=self.settings.min_ear_width,
             minimum_confidence=config["minimum_confidence"],
-            ear_side=test.ear_side,
+            ear_side=ear_side if jewelry_type == "earring" else "left",
+            require_ear_visibility=jewelry_type == "earring",
         )
         faces = self._detect_faces(raw_frames)
         evaluated = selector.evaluate(raw_frames, faces)
@@ -208,7 +234,7 @@ class TestRunner:
             self._set_step(session, run, "frame_selection", layer1, layer1_detail, 68)
 
         earlobe_detector = EarlobeDetector(self.settings.min_ear_width)
-        validator = validator_for("earring")
+        validator = validator_for(jewelry_type)
         palette = OverlayPalette(
             self.settings.overlay_earlobe_color,
             self.settings.overlay_earring_color,
@@ -227,11 +253,20 @@ class TestRunner:
         missing_earlobe = {side: 0 for side in sides}
         missing_earring = {side: 0 for side in sides}
         frame_payloads: list[dict] = []
+        necklace_frame_lays: list[dict] = []
+        earring_frame_lays: list[dict] = []
+        ring_frame_lays: list[dict] = []
+        bracelet_frame_lays: list[dict] = []
+        bangle_frame_lays: list[dict] = []
 
         with session_scope() as session:
             run = self._require_run(session, run_id)
-            self._set_step(session, run, "earlobe_detection", "RUNNING", "Detecting earlobe anchors...", 74)
-            self._set_step(session, run, "earring_detection", "RUNNING", "Detecting earring attachment anchors...", 80)
+            body_label = "earlobe" if jewelry_type == "earring" else f"{jewelry_type} body"
+            jewel_label = "earring" if jewelry_type == "earring" else jewelry_type
+            self._set_step(session, run, "earlobe_detection", "RUNNING", f"Detecting {body_label} anchors...", 74)
+            self._set_step(session, run, "earring_detection", "RUNNING", f"Detecting {jewel_label} attachment anchors...", 80)
+
+        from app.cv.body_geometry import body_anchor_for
 
         for item in evaluated:
             self._persist_frame_row(run_id, item, selected_ids)
@@ -245,34 +280,115 @@ class TestRunner:
             annotated = image
             side_results = []
             for side in sides:
-                earlobe, earlobe_error = earlobe_detector.detect(item.face, side)
-                if earlobe is None:
+                if jewelry_type == "earring":
+                    body, body_error = earlobe_detector.detect(item.face, side)
+                else:
+                    body, body_error = body_anchor_for(jewelry_type, item.face, side)
+                if body is None:
                     missing_earlobe[side] += 1
-                earring = self.debug_detector.detect_from_state(item.raw.debug_state, side)
-                if earring is None or not earring.visible or earring.x is None:
-                    earring = self.fallback_detector.detect(
+                jewelry = self.debug_detector.detect_from_state(item.raw.debug_state, side if side != "center" else "left")
+                if jewelry is None or not jewelry.visible or jewelry.x is None:
+                    jewelry = self.fallback_detector.detect(
                         image,
-                        earlobe,
-                        side=side,
-                        reference=reference_vector,
-                        reference_bgr=reference_bgr,
+                        body,
+                        side=side if side != "center" else "left",
+                        reference=reference_vector if jewelry_type == "earring" else None,
+                        reference_bgr=reference_bgr if jewelry_type == "earring" else None,
                     )
-                    if earring.x is None:
+                    if jewelry.x is None:
                         missing_earring[side] += 1
-                measurement = validator.validate(earlobe, earring, config=config)
+                measurement = validator.validate(body, jewelry, config=config)
+                necklace_lay = None
+                ring_lay = None
+                bracelet_lay = None
+                bangle_lay = None
+                if jewelry_type == "necklace":
+                    left_jewel = self.debug_detector.detect_from_state(item.raw.debug_state, "left")
+                    right_jewel = self.debug_detector.detect_from_state(item.raw.debug_state, "right")
+                    necklace_lay = evaluate_necklace_lay(
+                        item.face,
+                        body,
+                        jewelry,
+                        config=config,
+                        left_jewelry=left_jewel,
+                        right_jewelry=right_jewel,
+                    )
+                    measurement = measurement_from_necklace_lay(necklace_lay, measurement)
+                    necklace_frame_lays.append(necklace_lay)
+                elif jewelry_type == "ring":
+                    ring_lay = evaluate_ring_lay(
+                        item.face,
+                        body,
+                        jewelry,
+                        config=config,
+                        selected_finger=selected_finger,
+                        side=side if side in {"left", "right"} else "left",
+                        debug_state=item.raw.debug_state if isinstance(item.raw.debug_state, dict) else None,
+                    )
+                    measurement = measurement_from_ring_lay(ring_lay, measurement)
+                    ring_frame_lays.append(ring_lay)
+                elif jewelry_type == "bracelet":
+                    bracelet_lay = evaluate_bracelet_lay(
+                        item.face,
+                        body,
+                        jewelry,
+                        config=config,
+                        side=side if side in {"left", "right"} else "left",
+                        jewelry_id=jewelry_id,
+                        debug_state=item.raw.debug_state if isinstance(item.raw.debug_state, dict) else None,
+                    )
+                    measurement = measurement_from_bracelet_lay(bracelet_lay, measurement)
+                    bracelet_frame_lays.append(bracelet_lay)
+                elif jewelry_type == "bangle":
+                    bangle_lay = evaluate_bangle_lay(
+                        item.face,
+                        body,
+                        jewelry,
+                        config=config,
+                        side=side if side in {"left", "right"} else "left",
+                        jewelry_id=jewelry_id,
+                        debug_state=item.raw.debug_state if isinstance(item.raw.debug_state, dict) else None,
+                    )
+                    measurement = measurement_from_bangle_lay(bangle_lay, measurement)
+                    bangle_frame_lays.append(bangle_lay)
                 per_side_statuses[side].append(measurement.status)
                 per_side_measurements[side].append(measurement)
                 annotated = annotate_frame(
                     annotated,
-                    earlobe,
-                    earring,
+                    body,
+                    jewelry,
                     palette=palette,
                     pass_threshold=config["pass_threshold"],
                     fail_threshold=config["fail_threshold"],
                     zone_y_scale=config["zone_y_scale"],
                     normalized_distance=measurement.normalized_distance,
                 )
-                side_results.append((side, earlobe, earring, measurement, earlobe_error))
+                side_results.append(
+                    (side, body, jewelry, measurement, body_error, necklace_lay, ring_lay, bracelet_lay, bangle_lay)
+                )
+
+            earring_lay = None
+            if jewelry_type == "earring":
+                earring_lay = evaluate_earring_lay(
+                    item.face,
+                    [
+                        (side, body, jewelry)
+                        for side, body, jewelry, _m, _e, _n, _r, _br, _bg in side_results
+                    ],
+                    config=config,
+                    required_sides=list(sides),
+                )
+                earring_frame_lays.append(earring_lay)
+                updated_side_results = []
+                for side, body, jewelry, measurement, body_error, necklace_lay, ring_lay, bracelet_lay, bangle_lay in side_results:
+                    side_meas = measurement_from_earring_lay(earring_lay, side, measurement)
+                    per_side_statuses[side][-1] = side_meas.status
+                    per_side_measurements[side][-1] = side_meas
+                    updated_side_results.append(
+                        (side, body, jewelry, side_meas, body_error, necklace_lay, ring_lay, bracelet_lay, bangle_lay)
+                    )
+                side_results = updated_side_results
+
             annotated_path = output_dir / "annotated_frames" / f"frame_{item.raw.index:04d}.png"
             save_image(annotated_path, annotated)
             selected_copy = output_dir / "selected_frames" / item.raw.path.name
@@ -280,8 +396,20 @@ class TestRunner:
             if not selected_copy.exists():
                 shutil.copy(item.raw.path, selected_copy)
             self._update_annotated_path(run_id, item, annotated_path)
-            for side, earlobe, earring, measurement, earlobe_error in side_results:
-                payload = self._frame_payload(item, side, earlobe, earring, measurement, earlobe_error)
+            for side, body, jewelry, measurement, body_error, necklace_lay, ring_lay, bracelet_lay, bangle_lay in side_results:
+                payload = self._frame_payload(
+                    item,
+                    side,
+                    body,
+                    jewelry,
+                    measurement,
+                    body_error,
+                    necklace_lay=necklace_lay,
+                    earring_lay=earring_lay,
+                    ring_lay=ring_lay,
+                    bracelet_lay=bracelet_lay,
+                    bangle_lay=bangle_lay,
+                )
                 frame_payloads.append(payload)
                 self._persist_frame_result(run_id, item, payload)
 
@@ -338,7 +466,88 @@ class TestRunner:
             missing_earring=missing_earring,
             selected_count=len(selected),
             config=config,
+            jewelry_type=jewelry_type,
         )
+        necklace_lay_summary = None
+        if jewelry_type == "necklace":
+            necklace_lay_summary = aggregate_necklace_lay(necklace_frame_lays)
+            if necklace_lay_summary.get("final_result") == "FAIL":
+                overall = "FAIL"
+                reason = necklace_lay_summary.get("reason") or reason
+                action = (
+                    "Reposition the necklace around the neck so the chain follows the neckline "
+                    "and the pendant hangs toward the upper chest."
+                )
+            elif necklace_lay_summary.get("final_result") == "WARNING" and overall == "PASS":
+                overall = "WARNING"
+                reason = necklace_lay_summary.get("reason") or reason
+                action = "Review necklace frames for uneven sides or a slightly misaligned pendant."
+            elif necklace_lay_summary.get("final_result") == "PASS" and overall in {"PASS", "WARNING"}:
+                reason = necklace_lay_summary.get("reason") or reason
+        earring_lay_summary = None
+        if jewelry_type == "earring":
+            earring_lay_summary = aggregate_earring_lay(earring_frame_lays)
+            if earring_lay_summary.get("final_result") == "FAIL":
+                overall = "FAIL"
+                reason = earring_lay_summary.get("reason") or reason
+                action = (
+                    "Reposition the earrings so each attachment sits on the intended earlobe "
+                    "or piercing point, not floating on the cheek, neck, or face."
+                )
+            elif earring_lay_summary.get("final_result") == "WARNING" and overall == "PASS":
+                overall = "WARNING"
+                reason = earring_lay_summary.get("reason") or reason
+                action = "Review earring frames for partial occlusion, slight misalignment, or uneven sides."
+            elif earring_lay_summary.get("final_result") == "PASS" and overall in {"PASS", "WARNING"}:
+                reason = earring_lay_summary.get("reason") or reason
+        ring_lay_summary = None
+        if jewelry_type == "ring":
+            ring_lay_summary = aggregate_ring_lay(ring_frame_lays)
+            if ring_lay_summary.get("final_result") == "FAIL":
+                overall = "FAIL"
+                reason = ring_lay_summary.get("reason") or reason
+                action = (
+                    "Reposition the ring around the selected finger near the finger base, "
+                    "aligned with the finger center — not on the palm, knuckle, or adjacent fingers."
+                )
+            elif ring_lay_summary.get("final_result") == "WARNING" and overall == "PASS":
+                overall = "WARNING"
+                reason = ring_lay_summary.get("reason") or reason
+                action = "Review ring frames for partial hand visibility, slight tilt, or low ring confidence."
+            elif ring_lay_summary.get("final_result") == "PASS" and overall in {"PASS", "WARNING"}:
+                reason = ring_lay_summary.get("reason") or reason
+        bracelet_lay_summary = None
+        if jewelry_type == "bracelet":
+            bracelet_lay_summary = aggregate_bracelet_lay(bracelet_frame_lays)
+            if bracelet_lay_summary.get("final_result") == "FAIL":
+                overall = "FAIL"
+                reason = bracelet_lay_summary.get("reason") or reason
+                action = (
+                    "Reposition the bracelet around the wrist near the wrist joint, "
+                    "aligned with the wrist center — not on the palm, fingers, or upper forearm."
+                )
+            elif bracelet_lay_summary.get("final_result") == "WARNING" and overall == "PASS":
+                overall = "WARNING"
+                reason = bracelet_lay_summary.get("reason") or reason
+                action = "Review bracelet frames for partial wrist visibility, clothing occlusion, or slight tilt."
+            elif bracelet_lay_summary.get("final_result") == "PASS" and overall in {"PASS", "WARNING"}:
+                reason = bracelet_lay_summary.get("reason") or reason
+        bangle_lay_summary = None
+        if jewelry_type == "bangle":
+            bangle_lay_summary = aggregate_bangle_lay(bangle_frame_lays)
+            if bangle_lay_summary.get("final_result") == "FAIL":
+                overall = "FAIL"
+                reason = bangle_lay_summary.get("reason") or reason
+                action = (
+                    "Reposition the bangle around the wrist so it keeps a natural circular or oval shape "
+                    "at the wrist joint — not on the palm, fingers, or upper forearm."
+                )
+            elif bangle_lay_summary.get("final_result") == "WARNING" and overall == "PASS":
+                overall = "WARNING"
+                reason = bangle_lay_summary.get("reason") or reason
+                action = "Review bangle frames for tilt, uneven multi-bangle spacing, or partial wrist visibility."
+            elif bangle_lay_summary.get("final_result") == "PASS" and overall in {"PASS", "WARNING"}:
+                reason = bangle_lay_summary.get("reason") or reason
         statistics = self._statistics(len(raw_frames), len(evaluated), selected, temporal, sides)
         report = {
             "test_run_id": run_id,
@@ -347,6 +556,7 @@ class TestRunner:
             "overall_status": overall,
             "reason": reason,
             "recommended_action": action,
+            "jewelry_type": jewelry_type,
             "layers": {
                 "frame_selection": {"status": layer1, "detail": layer1_detail},
                 "anchor_detection": {"status": layer2, "detail": self._layer2_detail(sides, missing_earlobe, missing_earring, len(selected))},
@@ -373,11 +583,23 @@ class TestRunner:
             "frames": frame_payloads,
             "rejection_summary": self._rejection_summary(evaluated),
         }
+        if necklace_lay_summary is not None:
+            report["necklace_lay"] = necklace_lay_summary
+        if earring_lay_summary is not None:
+            report["earring_lay"] = earring_lay_summary
+        if ring_lay_summary is not None:
+            report["ring_lay"] = ring_lay_summary
+            report["selected_finger"] = selected_finger
+        if bracelet_lay_summary is not None:
+            report["bracelet_lay"] = bracelet_lay_summary
+        if bangle_lay_summary is not None:
+            report["bangle_lay"] = bangle_lay_summary
         report_path = self.reports.write(output_dir, report)
         reports_copy = self.settings.data_dir / "reports" / f"{run_id}.json"
         reports_copy.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(report_path, reports_copy)
         log_event("REPORT_GENERATED", test_run_id=run_id, overall_status=overall)
+        self._save_tested_application(run_id)
 
         with session_scope() as session:
             run = self._require_run(session, run_id)
@@ -483,8 +705,22 @@ class TestRunner:
             )
             session.commit()
 
-    def _frame_payload(self, item, side, earlobe, earring, measurement: PlacementMeasurement, earlobe_error) -> dict:
-        return {
+    def _frame_payload(
+        self,
+        item,
+        side,
+        earlobe,
+        earring,
+        measurement: PlacementMeasurement,
+        earlobe_error,
+        *,
+        necklace_lay: dict | None = None,
+        earring_lay: dict | None = None,
+        ring_lay: dict | None = None,
+        bracelet_lay: dict | None = None,
+        bangle_lay: dict | None = None,
+    ) -> dict:
+        payload = {
             "frame_number": item.raw.index,
             "timestamp_ms": item.raw.timestamp_ms,
             "side": side,
@@ -527,6 +763,17 @@ class TestRunner:
             if earlobe is None
             else {"ear_width": earlobe.ear_width, "ear_height": earlobe.ear_height},
         }
+        if necklace_lay is not None:
+            payload["necklace_lay"] = necklace_lay
+        if earring_lay is not None:
+            payload["earring_lay"] = earring_lay
+        if ring_lay is not None:
+            payload["ring_lay"] = ring_lay
+        if bracelet_lay is not None:
+            payload["bracelet_lay"] = bracelet_lay
+        if bangle_lay is not None:
+            payload["bangle_lay"] = bangle_lay
+        return payload
 
     def _reference_report(self, sides, measurements, reference_vector, validator, config) -> dict:
         if reference_vector is None:
@@ -564,6 +811,7 @@ class TestRunner:
         missing_earring = kwargs["missing_earring"]
         selected_count = kwargs["selected_count"]
         config = kwargs["config"]
+        jewelry_type = kwargs.get("jewelry_type") or "earring"
         if layer1 == "FAIL":
             return (
                 "FAIL",
@@ -571,14 +819,16 @@ class TestRunner:
                 "Improve face and ear visibility, reduce blur, or lower the capture motion.",
             )
         chunks = []
+        body_name = "earlobe" if jewelry_type == "earring" else ("neck" if jewelry_type == "necklace" else f"{jewelry_type} body")
+        jewel_name = "earring" if jewelry_type == "earring" else jewelry_type
         for side in sides:
             if missing_earlobe[side]:
                 chunks.append(
-                    f"Unable to detect {side} earlobe in {missing_earlobe[side]} of {selected_count} selected frames."
+                    f"Unable to detect {side} {body_name} in {missing_earlobe[side]} of {selected_count} selected frames."
                 )
             if missing_earring[side]:
                 chunks.append(
-                    f"Unable to detect {side} earring attachment anchor in {missing_earring[side]} of {selected_count} selected frames."
+                    f"Unable to detect {side} {jewel_name} attachment anchor in {missing_earring[side]} of {selected_count} selected frames."
                 )
         rate_ok = all(temporal[side].pass_rate >= config["minimum_pass_rate"] for side in sides)
         consecutive_ok = all(
@@ -586,7 +836,7 @@ class TestRunner:
         )
         reference_ok = reference_status in {"PASS", "NOT_RUN", "WARNING"}
         if critical:
-            chunks.append("A required ear had no successful anchor pair.")
+            chunks.append(f"A required {body_name} had no successful anchor pair.")
         if layer3 == "FAIL":
             chunks.append(" ".join(temporal[side].reason for side in sides))
         if reference_status == "FAIL":
@@ -600,8 +850,56 @@ class TestRunner:
             and reference_status in {"PASS", "NOT_RUN"}
         )
         if passed:
+            if jewelry_type == "necklace":
+                return (
+                    "PASS",
+                    "Necklace is positioned around the neck and follows the natural neckline.",
+                    "None.",
+                )
+            if jewelry_type == "ring":
+                return (
+                    "PASS",
+                    "Ring is positioned around the selected finger near the natural finger base.",
+                    "None.",
+                )
+            if jewelry_type == "bracelet":
+                return (
+                    "PASS",
+                    "Bracelet is positioned around the wrist near the wrist joint.",
+                    "None.",
+                )
+            if jewelry_type == "bangle":
+                return (
+                    "PASS",
+                    "Bangle is positioned around the wrist and keeps a natural circular or oval shape.",
+                    "None.",
+                )
             return ("PASS", "Earring attachment points stayed inside the earlobe placement zone.", "None.")
         if layer3 == "WARNING" and layer2 in {"PASS", "WARNING"} and critical == 0 and reference_ok:
+            if jewelry_type == "necklace":
+                return (
+                    "WARNING",
+                    "Necklace placement is near the edge of the allowed neckline zone.",
+                    "Review warning frames for uneven sides or a slightly misaligned pendant.",
+                )
+            if jewelry_type == "ring":
+                return (
+                    "WARNING",
+                    "Ring placement is near the edge of the allowed finger zone.",
+                    "Review warning frames for slight tilt, partial hand visibility, or low ring confidence.",
+                )
+            if jewelry_type == "bracelet":
+                return (
+                    "WARNING",
+                    "Bracelet placement is near the edge of the allowed wrist zone.",
+                    "Review warning frames for clothing occlusion, slight tilt, or partial wrist visibility.",
+                )
+            if jewelry_type == "bangle":
+                return (
+                    "WARNING",
+                    "Bangle placement is near the edge of the allowed wrist zone.",
+                    "Review warning frames for tilt, uneven multi-bangle spacing, or partial wrist visibility.",
+                )
             return (
                 "WARNING",
                 "Placement is near the edge of the allowed earlobe zone.",
@@ -609,10 +907,18 @@ class TestRunner:
             )
         reason = " ".join(chunks) or "Placement validation failed."
         action = "Check camera angle or improve ear visibility."
+        if jewelry_type == "necklace":
+            action = "Confirm the face and neck are visible and the necklace sits on the neckline."
+        if jewelry_type == "ring":
+            action = "Confirm the hand and selected finger are visible and the ring sits near the finger base."
+        if jewelry_type == "bracelet":
+            action = "Confirm the wrist is visible and the bracelet sits around the wrist joint."
+        if jewelry_type == "bangle":
+            action = "Confirm the wrist is visible and the bangle sits around the wrist with a natural circle/oval."
         if any(missing_earring.values()):
             action = (
                 "Expose the AIJewel debug anchor (window.__AIJEWEL_QA__ or GET /debug/tryon-state) "
-                "so the attachment point is projected from the earring transform."
+                "so the attachment point is projected from the jewelry transform."
             )
         return ("FAIL", reason, action)
 
@@ -693,6 +999,7 @@ class TestRunner:
             "zone_y_scale": test.zone_y_scale,
             "min_selected_frames": test.min_selected_frames,
             "max_selected_frames": test.max_selected_frames,
+            "selected_finger": getattr(test, "selected_finger", None) or "ring",
         }
 
     def _set_step(
@@ -724,7 +1031,23 @@ class TestRunner:
             run.status = "running"
         run_repo.save_run(session, run)
 
+    def _save_tested_application(self, run_id: str) -> None:
+        from app.services.application_service import ApplicationService
+
+        try:
+            with session_scope() as session:
+                run = session.get(TestRun, run_id)
+                if run is None:
+                    return
+                test = session.get(TestDefinition, run.test_id)
+                if test is None:
+                    return
+                ApplicationService().save_tested_application(session, test.application_id)
+        except Exception:
+            log_event("APPLICATION_SAVE_FAILED", test_run_id=run_id)
+
     def _fail(self, run_id: str, exc: Exception) -> None:
+        self._save_tested_application(run_id)
         message = str(exc) or exc.__class__.__name__
         action = getattr(exc, "recommended_action", None) or "Review the stage message and run the test again."
         with session_scope() as session:

@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 
 from app.adapters.browser_adapter import PlaywrightBrowserAdapter
+from app.cv.visualization import image_from_bytes, save_catalog_sprite
 from app.adapters.earring_anchor_adapter import EarringAnchorPageAdapter
 from app.adapters.screenshot_adapter import ScreenshotAdapter
 from app.core.logging import log_event
@@ -107,6 +108,9 @@ class PlaywrightTryOnAdapter(TryOnApplicationAdapter):
         self.screenshots = ScreenshotAdapter(self.browser)
         self.anchors = EarringAnchorPageAdapter(self.browser)
         self.video_file: Path | None = None
+        from app.services.live_jewelry_overlay import LiveJewelryOverlay
+
+        self.live_overlay = LiveJewelryOverlay(self.browser, output_dir)
 
     async def connect(self) -> None:
         if not self.application.url:
@@ -128,6 +132,9 @@ class PlaywrightTryOnAdapter(TryOnApplicationAdapter):
         log_event("APPLICATION_CONNECTED", url=self.application.url)
 
     async def authenticate(self) -> None:
+        if not self.username or not self.password:
+            log_event("AUTHENTICATION_SUCCESS", detail="No credentials configured; skipping login.")
+            return
         password_selector = await self._wait_present(
             _split(self.application.password_selector) or PASSWORD_SELECTORS,
             timeout_ms=12000,
@@ -135,12 +142,6 @@ class PlaywrightTryOnAdapter(TryOnApplicationAdapter):
         if password_selector is None:
             log_event("AUTHENTICATION_SUCCESS", detail="No password field was present.")
             return
-        if not self.username or not self.password:
-            raise TryOnError(
-                "Authentication failed. The page has a login form and no credentials were provided.",
-                "AUTH_FAILED",
-                "Enter the tester username and password, then validate again.",
-            )
         username_selector = await self._wait_present(
             _split(self.application.username_selector) or USERNAME_SELECTORS,
             timeout_ms=3000,
@@ -190,19 +191,61 @@ class PlaywrightTryOnAdapter(TryOnApplicationAdapter):
         return None
 
     async def launch(self) -> None:
-        await self._reach_tryon()
-        await self._dismiss_overlays()
-        await self._click_exact("Video")
-        await self._leave_photo_matching()
+        if await self._is_storefront():
+            await self._open_storefront_tryon()
+        else:
+            await self._reach_tryon()
+            await self._dismiss_overlays()
+            await self._click_exact("Video")
+            await self._leave_photo_matching()
         ready = await self._wait_for_canvas(timeout_ms=90000)
         if not ready:
             raise TryOnError(
                 "Try-on application did not reach the ready state.",
                 "APPLICATION_NOT_READY",
-                "Confirm login reaches the try-on view and the face canvas is visible.",
+                "Confirm the try-on viewport opens. On the storefront, click Try ON so the camera view appears.",
             )
         await self._leave_photo_matching()
         log_event("TRYON_READY")
+
+    async def _is_storefront(self) -> bool:
+        return bool(
+            await self.browser.evaluate(
+                """() => Boolean(
+                  document.querySelector('button.header-try-on, button.try-on, article.card')
+                )"""
+            )
+        )
+
+    async def _open_storefront_tryon(self) -> None:
+        """New Amplify dump opens try-on from a Try ON button into an embedded iframe."""
+        await self._dismiss_overlays()
+        opened = await self.browser.evaluate(
+            """() => {
+              const cards = [...document.querySelectorAll('article.card')];
+              const earring = cards.find((card) => /earring/i.test(card.innerText || ''));
+              const card = earring || cards[0];
+              const cardButton = card && card.querySelector('button.try-on');
+              if (cardButton) {
+                cardButton.click();
+                return 'card';
+              }
+              const header = document.querySelector('button.header-try-on');
+              if (header) {
+                header.click();
+                return 'header';
+              }
+              return '';
+            }"""
+        )
+        if not opened:
+            raise TryOnError(
+                "The storefront Try ON control was not found.",
+                "APPLICATION_NOT_READY",
+                "Open the jewelry storefront URL and confirm a Try ON button is visible.",
+            )
+        await self.browser.wait_for_timeout(2000)
+        log_event("STOREFRONT_TRYON_OPENED", source=opened)
 
     async def _reach_tryon(self) -> None:
         target = self.application.url
@@ -215,52 +258,51 @@ class PlaywrightTryOnAdapter(TryOnApplicationAdapter):
                 continue
             if "/try-on" in href:
                 return
+            if await self._is_storefront():
+                return
             if target:
                 await self.browser.goto(target)
             await self.browser.wait_for_timeout(1500)
 
     async def _wait_for_tryon_view(self) -> None:
-        for _ in range(60):
-            ready = await self.browser.evaluate(
-                """() => {
-                  const text = document.body.innerText || '';
-                  if (text.includes('Loading try-on')) return false;
-                  return [...document.querySelectorAll('iframe')].some((frame) => {
-                    const src = frame.getAttribute('src') || '';
-                    if (src.includes('advertisement')) return false;
-                    const box = frame.getBoundingClientRect();
-                    return box.width > 80 && box.height > 80;
-                  });
-                }"""
-            )
-            if ready:
-                await self.browser.wait_for_timeout(1000)
-                return
-            await self.browser.wait_for_timeout(500)
+        if await self._wait_for_canvas(timeout_ms=30000):
+            return
         raise TryOnError(
             "The try-on viewport did not open, so the advertisement video was not used.",
             "APPLICATION_NOT_READY",
-            "Stay on Video mode until the try-on face is visible, then run the test again.",
+            "Open Try ON until the camera view is visible, then run the test again.",
         )
 
     async def _wait_for_canvas(self, timeout_ms: int) -> bool:
         elapsed = 0
+        retried_storefront = False
         while elapsed <= timeout_ms:
             await self._leave_photo_matching()
             ready = await self.browser.evaluate(
                 """() => {
                   const text = document.body.innerText || '';
                   if (text.includes('Loading try-on')) return false;
-                  return [...document.querySelectorAll('iframe')].some((frame) => {
-                    const src = frame.getAttribute('src') || '';
+                  const frames = [...document.querySelectorAll('iframe')];
+                  const hasFrame = frames.some((frame) => {
+                    const src = (frame.getAttribute('src') || '').toLowerCase();
                     if (src.includes('advertisement')) return false;
                     const box = frame.getBoundingClientRect();
+                    return box.width > 80 && box.height > 80;
+                  });
+                  if (hasFrame) return true;
+                  return [...document.querySelectorAll('video, canvas')].some((node) => {
+                    const box = node.getBoundingClientRect();
                     return box.width > 80 && box.height > 80;
                   });
                 }"""
             )
             if ready:
+                # Storefront may show "Starting try-on…" briefly while the iframe boots.
+                await self.browser.wait_for_timeout(1500)
                 return True
+            if not retried_storefront and elapsed >= 3000 and await self._is_storefront():
+                retried_storefront = True
+                await self._open_storefront_tryon()
             await self.browser.wait_for_timeout(500)
             elapsed += 500
         return False
@@ -355,26 +397,59 @@ class PlaywrightTryOnAdapter(TryOnApplicationAdapter):
         return bool(clicked)
 
     async def select_jewelry(self, jewelry_id: str | None) -> str:
+        if await self._is_storefront():
+            return await self._select_storefront_jewelry(jewelry_id)
         await self._click_exact("Video")
         await self._open_earring_catalog()
         selected = None
         for _ in range(20):
             selected = await self.browser.evaluate(
-                """(jewelryId) => {
+                """async (jewelryId) => {
                   const text = document.body.innerText || '';
                   if (text.includes('No matching jewelry') || text.includes('Try All Categories')) return null;
                   const wanted = (jewelryId || '').trim().toLowerCase();
-                  const images = [...document.querySelectorAll('img')].filter((img) => /earring/i.test(img.alt || ''));
+                  const images = [...document.querySelectorAll('img')].filter((img) => (img.alt || '').trim());
                   const match = wanted
                     ? images.find((img) => (img.alt || '').toLowerCase().includes(wanted))
                     : images.find((img) => /stud earring/i.test(img.alt || ''));
                   if (!match) return null;
-                  (match.closest('button, a, [role="button"]') || match).click();
-                  return match.alt || 'earring';
+                  match.setAttribute('data-qa-selected-earring', '1');
+                  match.scrollIntoView({ block: 'center', inline: 'nearest' });
+                  if (match.decode) {
+                    try { await match.decode(); } catch (error) {}
+                  }
+                  const sources = [];
+                  const push = (url, width) => {
+                    if (!url) return;
+                    let absolute = url;
+                    try { absolute = new URL(url, document.baseURI).href; } catch (error) {}
+                    sources.push({ url: absolute, width: width || 0 });
+                  };
+                  push(match.currentSrc, match.naturalWidth || 0);
+                  push(match.src, 0);
+                  for (const part of (match.srcset || '').split(',')) {
+                    const bits = part.trim().split(/\\s+/);
+                    if (!bits[0]) continue;
+                    const descriptor = bits[1] || '';
+                    const width = descriptor.endsWith('w') ? parseInt(descriptor, 10) : 0;
+                    push(bits[0], Number.isFinite(width) ? width : 0);
+                  }
+                  sources.sort((a, b) => b.width - a.width);
+                  return { name: match.alt || 'earring', src: sources.length ? sources[0].url : '' };
                 }""",
                 jewelry_id or "",
             )
             if selected:
+                await self._save_catalog_photo(str(selected.get("src") or ""))
+                selected = selected.get("name") or "earring"
+                await self.browser.evaluate(
+                    """() => {
+                      const match = document.querySelector("img[data-qa-selected-earring='1']");
+                      if (!match) return false;
+                      (match.closest('button, a, [role="button"]') || match).click();
+                      return true;
+                    }"""
+                )
                 break
             await self._click_exact("Show All Category")
             await self._click_exact("Earrings")
@@ -400,6 +475,98 @@ class PlaywrightTryOnAdapter(TryOnApplicationAdapter):
             )
         return f"Selected catalogue earring {selected}."
 
+    async def _select_storefront_jewelry(self, jewelry_id: str | None) -> str:
+        await self.browser.evaluate(
+            """() => {
+              const close = [...document.querySelectorAll('button')].find(
+                (node) => (node.innerText || '').trim().toLowerCase() === 'close'
+              );
+              if (close) close.click();
+            }"""
+        )
+        await self.browser.wait_for_timeout(500)
+        wanted = (jewelry_id or "").strip().lower()
+        selected = await self.browser.evaluate(
+            """(wanted) => {
+              const cards = [...document.querySelectorAll('article.card')];
+              const card = wanted
+                ? cards.find((item) => {
+                    const name = (item.querySelector('h2')?.innerText || '').trim().toLowerCase();
+                    const sku = (item.querySelector('.sku')?.innerText || '').trim().toLowerCase();
+                    return name.includes(wanted) || sku.includes(wanted) || wanted.includes(name);
+                  })
+                : cards.find((item) => /earring/i.test(item.innerText || '')) || cards[0];
+              if (!card) return null;
+              const img = card.querySelector('img');
+              if (img) img.setAttribute('data-qa-selected-earring', '1');
+              const button = card.querySelector('button.try-on');
+              if (!button) return null;
+              button.click();
+              return {
+                name: (card.querySelector('h2')?.innerText || '').trim() || 'jewelry',
+                src: img ? (img.currentSrc || img.src || '') : '',
+              };
+            }""",
+            wanted,
+        )
+        if not selected:
+            raise TryOnError(
+                "The storefront jewelry was not selected.",
+                "JEWELRY_NOT_FOUND",
+                "Choose a jewelry ID that appears on the storefront catalog.",
+            )
+        await self._save_catalog_photo(str(selected.get("src") or ""))
+        await self.browser.wait_for_timeout(3000)
+        if not await self._wait_for_canvas(timeout_ms=30000):
+            raise TryOnError(
+                "The storefront try-on did not open after the jewelry was selected.",
+                "APPLICATION_NOT_READY",
+                "Click Try ON on the chosen jewelry and wait for the camera view.",
+            )
+        return f"Selected catalogue earring {selected.get('name') or 'jewelry'}."
+
+    async def _save_catalog_photo(self, src: str) -> bool:
+        """Keep the catalog product photo so the live try-on shows that earring, not a drawn stand-in."""
+        destination = self.output_dir / "selected_earring.png"
+        image = await self._catalog_image(src)
+        if image is not None and save_catalog_sprite(image, destination):
+            log_event("CATALOG_EARRING_SAVED", file=destination.name)
+            return True
+        saver = getattr(self.browser, "screenshot_first", None)
+        if saver is not None and await saver("img[data-qa-selected-earring='1']", destination):
+            image = image_from_bytes(destination.read_bytes())
+            if image is not None and save_catalog_sprite(image, destination):
+                log_event("CATALOG_EARRING_SAVED", file=destination.name, source="screenshot")
+                return True
+        log_event("CATALOG_EARRING_MISSING")
+        return False
+
+    async def _catalog_image(self, src: str):
+        fetch = getattr(self.browser, "fetch_bytes", None)
+        if fetch is not None and src:
+            payload = await fetch(src)
+            image = image_from_bytes(payload or b"")
+            if image is not None:
+                return image
+        raster = await self.browser.evaluate(
+            """async () => {
+              const match = document.querySelector("img[data-qa-selected-earring='1']");
+              if (!match || !match.naturalWidth) return null;
+              const canvas = document.createElement("canvas");
+              canvas.width = match.naturalWidth;
+              canvas.height = match.naturalHeight;
+              try {
+                canvas.getContext("2d").drawImage(match, 0, 0);
+                return canvas.toDataURL("image/png");
+              } catch (error) {
+                return null;
+              }
+            }"""
+        )
+        if fetch is None or not isinstance(raster, str):
+            return None
+        return image_from_bytes(await fetch(raster) or b"")
+
     async def use_straight_face_image(self, path: Path) -> None:
         """Show the uploaded face. Catalog earrings are placed on this photo, not matched to it."""
         await self._click_exact("Image")
@@ -410,6 +577,75 @@ class PlaywrightTryOnAdapter(TryOnApplicationAdapter):
             await self.browser.set_input_files("input[type='file']", path)
         await self.browser.wait_for_timeout(2000)
         await self._leave_photo_matching()
+
+    async def catalog_by_category(self) -> list[dict]:
+        """Open each try-on category and return the product names shown for that URL."""
+        from app.services.jewelry_catalog import CATALOG_CATEGORIES, names_for_category
+
+        if await self._is_storefront():
+            return await self._storefront_catalog_by_category()
+        found: list[dict] = []
+        for label in CATALOG_CATEGORIES:
+            await self._click_exact("Show All Category")
+            await self.browser.wait_for_timeout(300)
+            if not await self._click_exact(label):
+                continue
+            alts: list[str] = []
+            for _ in range(8):
+                await self.browser.wait_for_timeout(400)
+                raw = await self.browser.evaluate(
+                    """() => [...document.querySelectorAll('img')].map((img) => (img.alt || '').trim()).filter(Boolean)"""
+                )
+                alts = names_for_category(label, list(raw or []))
+                if alts:
+                    break
+            if alts:
+                found.append({"category": label, "items": alts})
+        return found
+
+    async def _storefront_catalog_by_category(self) -> list[dict]:
+        from app.services.jewelry_catalog import CATALOG_CATEGORIES
+
+        # Close an open try-on modal so category filters and cards are visible.
+        await self.browser.evaluate(
+            """() => {
+              const close = [...document.querySelectorAll('button')].find(
+                (node) => (node.innerText || '').trim().toLowerCase() === 'close'
+              );
+              if (close) close.click();
+            }"""
+        )
+        await self.browser.wait_for_timeout(500)
+        nav_labels = {
+            "Earrings": "EARRINGS",
+            "Necklaces": "NECKLACES",
+            "Bracelets": "BRACELETS",
+            "Rings": "RINGS",
+            "Bangles": "BANGLES",
+        }
+        found: list[dict] = []
+        for category in CATALOG_CATEGORIES:
+            label = nav_labels.get(category, category.upper())
+            if not await self._click_exact(label):
+                continue
+            await self.browser.wait_for_timeout(600)
+            names = await self.browser.evaluate(
+                """() => {
+                  const seen = new Set();
+                  const items = [];
+                  for (const card of document.querySelectorAll('article.card')) {
+                    const name = (card.querySelector('h2')?.innerText || '').trim();
+                    if (!name || seen.has(name)) continue;
+                    seen.add(name);
+                    items.push(name);
+                  }
+                  return items;
+                }"""
+            )
+            items = [str(name).strip() for name in (names or []) if str(name).strip()]
+            if items:
+                found.append({"category": category, "items": items})
+        return found
 
     async def catalog_earring_names(self) -> list[str]:
         await self._open_earring_catalog()
@@ -473,10 +709,13 @@ class PlaywrightTryOnAdapter(TryOnApplicationAdapter):
         for index in range(total):
             path = frame_dir / f"frame_{index:04d}.png"
             await self.screenshots.capture(path)
+            await self.live_overlay.update(path)
             state = await self.get_earring_anchor()
             frames.append(RawFrame(index=index, timestamp_ms=index * interval_ms, path=path, debug_state=state))
             if index < total - 1:
                 await self.browser.wait_for_timeout(interval_ms)
+        if self.live_overlay.shown:
+            await self.browser.wait_for_timeout(1500)
         meta_path = self.output_dir / "capture_meta.json"
         meta_path.write_text(
             json.dumps(
@@ -500,6 +739,7 @@ class PlaywrightTryOnAdapter(TryOnApplicationAdapter):
         return await self.anchors.read_state()
 
     async def close(self) -> None:
+        self.live_overlay.close()
         self.video_file = await self.browser.video_path()
         await self.browser.close()
 

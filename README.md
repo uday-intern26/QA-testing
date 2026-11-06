@@ -42,6 +42,34 @@ npm run dev
 
 Set `NEXT_PUBLIC_API_URL=http://localhost:8000` for the dev server.
 
+### Unified console (Try-On QA + Agentic QA)
+
+The sidebar has two sections in one dashboard:
+
+- **Try-On QA** — virtual try-on / earlobe alignment (this repo’s API on port 8000)
+- **Agentic QA** — contract-driven API testing (the `aijewel-agentic-qa` API)
+
+Start the Agentic QA API and recommendation mocks from `D:\QA TESTING\aijewel-agentic-qa`:
+
+```powershell
+# Agentic QA API (use 8001 if Try-On already owns 8000)
+.\.venv\Scripts\python -m uvicorn app.main:app --host 127.0.0.1 --port 8001
+
+# Healthy + defective recommendation mocks
+.\.venv\Scripts\python -m uvicorn mocks.recommendation_api:app --host 127.0.0.1 --port 8091
+$env:DEFECTS="over_budget,wrong_category,tenant_leak"
+.\.venv\Scripts\python -m uvicorn mocks.recommendation_api:app --host 127.0.0.1 --port 8092
+```
+
+In `frontend/.env.local`:
+
+```
+NEXT_PUBLIC_API_URL=http://localhost:8000
+AGENTIC_QA_API_URL=http://127.0.0.1:8001
+```
+
+Open http://localhost:3000 and use the **Agentic QA** sidebar links (Bench, Contracts, Scenarios, Runs). The UI proxies Agentic calls through `/api/agentic`.
+
 ## Tester workflow
 
 1. Open the dashboard and enter the public Amplify URL, username, and password.

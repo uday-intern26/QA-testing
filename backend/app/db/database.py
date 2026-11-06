@@ -42,7 +42,25 @@ def reset_engine() -> None:
 def init_db() -> None:
     from app import models  # noqa: F401
 
-    SQLModel.metadata.create_all(get_engine())
+    engine = get_engine()
+    SQLModel.metadata.create_all(engine)
+    _ensure_sqlite_columns(engine)
+
+
+def _ensure_sqlite_columns(engine) -> None:
+    """Add newly introduced columns on existing SQLite databases."""
+    url = str(engine.url)
+    if not url.startswith("sqlite"):
+        return
+    statements = (
+        ("tests", "selected_finger", "ALTER TABLE tests ADD COLUMN selected_finger VARCHAR DEFAULT 'ring'"),
+    )
+    with engine.begin() as connection:
+        for table, column, ddl in statements:
+            rows = connection.execute(text(f"PRAGMA table_info({table})")).fetchall()
+            existing = {str(row[1]) for row in rows}
+            if column not in existing:
+                connection.execute(text(ddl))
 
 
 def get_session() -> Iterator[Session]:

@@ -1,6 +1,8 @@
 import json
+from pathlib import Path
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi.responses import FileResponse
 from sqlmodel import Session
 
 from app.api.dependencies import get_app_settings, get_db
@@ -28,14 +30,6 @@ async def run_test(
     application = session.get(Application, test.application_id)
     if application is None:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Application was not found."})
-    if application.type == "web" and not payload.password:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "code": "CREDENTIALS_REQUIRED",
-                "message": "A password is required to run a web application test and is kept only for this execution.",
-            },
-        )
     active = run_repo.latest_run(session, test_id)
     if active and active.status in {"pending", "running"}:
         raise HTTPException(
@@ -49,8 +43,27 @@ async def run_test(
     return TestRunAccepted(test_id=test_id, test_run_id=run.id, status=run.status)
 
 
+@router.get("/{test_id}/live-preview")
+def live_preview(
+    test_id: str,
+    session: Session = Depends(get_db),
+    settings: Settings = Depends(get_app_settings),
+) -> FileResponse:
+    if run_repo.get_test(session, test_id) is None:
+        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Test was not found."})
+    run = run_repo.latest_run(session, test_id)
+    path = Path(settings.data_dir) / "results" / (run.id if run else "") / "live_preview.png"
+    if run is None or not path.is_file():
+        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Live jewelry preview is not ready."})
+    return FileResponse(path, media_type="image/png", headers={"Cache-Control": "no-store"})
+
+
 @router.get("/{test_id}/status", response_model=TestStatusRead)
-def test_status(test_id: str, session: Session = Depends(get_db)) -> TestStatusRead:
+def test_status(
+    test_id: str,
+    session: Session = Depends(get_db),
+    settings: Settings = Depends(get_app_settings),
+) -> TestStatusRead:
     if run_repo.get_test(session, test_id) is None:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Test was not found."})
     run = run_repo.latest_run(session, test_id)
@@ -65,6 +78,7 @@ def test_status(test_id: str, session: Session = Depends(get_db)) -> TestStatusR
             steps=[],
         )
     steps = [StepStatus.model_validate(item) for item in json.loads(run.steps_json or "[]")]
+    preview = Path(settings.data_dir) / "results" / run.id / "live_preview.png"
     return TestStatusRead(
         test_id=test_id,
         test_run_id=run.id,
@@ -77,4 +91,7 @@ def test_status(test_id: str, session: Session = Depends(get_db)) -> TestStatusR
         error=run.error,
         reason=run.reason,
         recommended_action=run.recommended_action,
+        preview_image_url=(
+            f"{settings.api_prefix}/tests/{test_id}/live-preview" if preview.is_file() else None
+        ),
     )

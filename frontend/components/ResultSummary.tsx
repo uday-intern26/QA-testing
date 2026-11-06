@@ -73,13 +73,228 @@ export function ResultSummary({ report }: { report: QaReport }) {
           <p className="mt-2 text-zinc-500">{reference.reason}</p>
         </div>
       ) : null}
+      {report.jewelry_type === "bangle" && report.bangle_lay ? (
+        <div className="rounded-lg border border-zinc-800 p-4 text-sm">
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <h3 className="font-medium text-zinc-200">
+              Bangle lay result
+              {report.bangle_lay.wrist_side ? ` · ${report.bangle_lay.wrist_side}` : ""}
+              {report.bangle_lay.bangle_count && report.bangle_lay.bangle_count > 1
+                ? ` · ${report.bangle_lay.bangle_count} bangles`
+                : ""}
+            </h3>
+            <StatusBadge status={report.bangle_lay.final_result} />
+          </div>
+          <div className="grid gap-2 md:grid-cols-2">
+            {(
+              [
+                ["Wrist Detection", "wrist_detection"],
+                ["Wrist Landmark Detection", "wrist_landmark_detection"],
+                ["Bangle Placement", "bangle_placement"],
+                ["Wrist Alignment", "wrist_alignment"],
+                ["Circular/Oval Alignment", "circular_oval_alignment"],
+                ["Center Alignment", "bangle_center_alignment"],
+                ["Wrist Coverage", "wrist_coverage"],
+                ["Hand Clearance", "hand_clearance"],
+                ["Forearm Clearance", "forearm_clearance"],
+                ["Multiple Bangle Spacing", "multiple_bangle_spacing"],
+              ] as const
+            ).map(([label, key]) => (
+              <div key={key} className="flex items-center justify-between rounded border border-zinc-800 px-3 py-2">
+                <span className="text-zinc-400">{label}</span>
+                <StatusBadge status={report.bangle_lay?.checks?.[key] || "FAIL"} />
+              </div>
+            ))}
+          </div>
+          <div className="mt-4 grid gap-3 md:grid-cols-2">
+            <Metric
+              label="Overall bangle lay accuracy"
+              value={`${report.bangle_lay.overall_bangle_lay_accuracy_pct.toFixed(1)}%`}
+            />
+            <Metric label="Final result" value={report.bangle_lay.final_result} />
+          </div>
+          {report.bangle_lay.ground_truth_accuracy_pct != null ? (
+            <p className="mt-2 text-zinc-400">
+              Ground-truth accuracy (vs manual reviews): {report.bangle_lay.ground_truth_accuracy_pct.toFixed(1)}%
+            </p>
+          ) : null}
+          {report.bangle_lay.reason ? <p className="mt-2 text-zinc-400">{report.bangle_lay.reason}</p> : null}
+          {report.bangle_lay.note ? <p className="mt-1 text-xs text-zinc-500">{report.bangle_lay.note}</p> : null}
+        </div>
+      ) : null}
+      {report.jewelry_type === "bracelet" && report.bracelet_lay ? (
+        <div className="rounded-lg border border-zinc-800 p-4 text-sm">
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <h3 className="font-medium text-zinc-200">
+              Bracelet lay result
+              {report.bracelet_lay.wrist_side ? ` · ${report.bracelet_lay.wrist_side}` : ""}
+              {report.bracelet_lay.bracelet_style ? ` · ${report.bracelet_lay.bracelet_style}` : ""}
+            </h3>
+            <StatusBadge status={report.bracelet_lay.final_result} />
+          </div>
+          <div className="grid gap-2 md:grid-cols-2">
+            {(
+              [
+                ["Wrist Detection", "wrist_detection"],
+                ["Wrist Landmark Detection", "wrist_landmark_detection"],
+                ["Bracelet Placement", "bracelet_placement"],
+                ["Wrist Alignment", "wrist_alignment"],
+                ["Center Alignment", "bracelet_center_alignment"],
+                ["Wrist Coverage", "wrist_coverage"],
+                ["Hand Clearance", "hand_clearance"],
+                ["Forearm Clearance", "forearm_clearance"],
+              ] as const
+            ).map(([label, key]) => (
+              <div key={key} className="flex items-center justify-between rounded border border-zinc-800 px-3 py-2">
+                <span className="text-zinc-400">{label}</span>
+                <StatusBadge status={report.bracelet_lay?.checks?.[key] || "FAIL"} />
+              </div>
+            ))}
+          </div>
+          <div className="mt-4 grid gap-3 md:grid-cols-2">
+            <Metric
+              label="Overall bracelet lay accuracy"
+              value={`${report.bracelet_lay.overall_bracelet_lay_accuracy_pct.toFixed(1)}%`}
+            />
+            <Metric label="Final result" value={report.bracelet_lay.final_result} />
+          </div>
+          {report.bracelet_lay.ground_truth_accuracy_pct != null ? (
+            <p className="mt-2 text-zinc-400">
+              Ground-truth accuracy (vs manual reviews): {report.bracelet_lay.ground_truth_accuracy_pct.toFixed(1)}%
+            </p>
+          ) : null}
+          {report.bracelet_lay.reason ? <p className="mt-2 text-zinc-400">{report.bracelet_lay.reason}</p> : null}
+          {report.bracelet_lay.note ? <p className="mt-1 text-xs text-zinc-500">{report.bracelet_lay.note}</p> : null}
+        </div>
+      ) : null}
+      {report.jewelry_type === "ring" && report.ring_lay ? (
+        <div className="rounded-lg border border-zinc-800 p-4 text-sm">
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <h3 className="font-medium text-zinc-200">
+              Ring lay result{report.ring_lay.selected_finger ? ` · ${report.ring_lay.selected_finger}` : ""}
+            </h3>
+            <StatusBadge status={report.ring_lay.final_result} />
+          </div>
+          <div className="grid gap-2 md:grid-cols-2">
+            {(
+              [
+                ["Hand Detection", "hand_detection"],
+                ["Selected Finger Detection", "selected_finger_detection"],
+                ["Ring Placement", "ring_placement"],
+                ["Finger Alignment", "finger_alignment"],
+                ["Ring Center Alignment", "ring_center_alignment"],
+                ["Knuckle Clearance", "knuckle_clearance"],
+                ["Ring Orientation", "ring_orientation"],
+              ] as const
+            ).map(([label, key]) => (
+              <div key={key} className="flex items-center justify-between rounded border border-zinc-800 px-3 py-2">
+                <span className="text-zinc-400">{label}</span>
+                <StatusBadge status={report.ring_lay?.checks?.[key] || "FAIL"} />
+              </div>
+            ))}
+          </div>
+          <div className="mt-4 grid gap-3 md:grid-cols-2">
+            <Metric
+              label="Overall ring lay accuracy"
+              value={`${report.ring_lay.overall_ring_lay_accuracy_pct.toFixed(1)}%`}
+            />
+            <Metric label="Final result" value={report.ring_lay.final_result} />
+          </div>
+          {report.ring_lay.ground_truth_accuracy_pct != null ? (
+            <p className="mt-2 text-zinc-400">
+              Ground-truth accuracy (vs manual reviews): {report.ring_lay.ground_truth_accuracy_pct.toFixed(1)}%
+            </p>
+          ) : null}
+          {report.ring_lay.reason ? <p className="mt-2 text-zinc-400">{report.ring_lay.reason}</p> : null}
+          {report.ring_lay.note ? <p className="mt-1 text-xs text-zinc-500">{report.ring_lay.note}</p> : null}
+        </div>
+      ) : null}
+      {report.jewelry_type === "earring" && report.earring_lay ? (
+        <div className="rounded-lg border border-zinc-800 p-4 text-sm">
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <h3 className="font-medium text-zinc-200">Earring lay result</h3>
+            <StatusBadge status={report.earring_lay.final_result} />
+          </div>
+          <div className="grid gap-2 md:grid-cols-2">
+            {(
+              [
+                ["Left Ear Detection", "left_ear_detection"],
+                ["Right Ear Detection", "right_ear_detection"],
+                ["Left Earring Placement", "left_earring_placement"],
+                ["Right Earring Placement", "right_earring_placement"],
+                ["Earlobe Alignment", "earlobe_alignment"],
+                ["Symmetry", "symmetry"],
+                ["Hanging Alignment", "hanging_alignment"],
+              ] as const
+            ).map(([label, key]) => (
+              <div key={key} className="flex items-center justify-between rounded border border-zinc-800 px-3 py-2">
+                <span className="text-zinc-400">{label}</span>
+                <StatusBadge status={report.earring_lay?.checks?.[key] || "FAIL"} />
+              </div>
+            ))}
+          </div>
+          <div className="mt-4 grid gap-3 md:grid-cols-2">
+            <Metric
+              label="Overall earring lay accuracy"
+              value={`${report.earring_lay.overall_earring_lay_accuracy_pct.toFixed(1)}%`}
+            />
+            <Metric label="Final result" value={report.earring_lay.final_result} />
+          </div>
+          {report.earring_lay.ground_truth_accuracy_pct != null ? (
+            <p className="mt-2 text-zinc-400">
+              Ground-truth accuracy (vs manual reviews): {report.earring_lay.ground_truth_accuracy_pct.toFixed(1)}%
+            </p>
+          ) : null}
+          {report.earring_lay.reason ? <p className="mt-2 text-zinc-400">{report.earring_lay.reason}</p> : null}
+          {report.earring_lay.note ? <p className="mt-1 text-xs text-zinc-500">{report.earring_lay.note}</p> : null}
+        </div>
+      ) : null}
+      {report.jewelry_type === "necklace" && report.necklace_lay ? (
+        <div className="rounded-lg border border-zinc-800 p-4 text-sm">
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <h3 className="font-medium text-zinc-200">Necklace lay result</h3>
+            <StatusBadge status={report.necklace_lay.final_result} />
+          </div>
+          <div className="grid gap-2 md:grid-cols-2">
+            {(
+              [
+                ["Neck Detection", "neck_detection"],
+                ["Necklace Placement", "necklace_placement"],
+                ["Neckline Alignment", "neckline_alignment"],
+                ["Center Alignment", "center_alignment"],
+                ["Pendant Position", "pendant_position"],
+                ["Shoulder Clearance", "shoulder_clearance"],
+              ] as const
+            ).map(([label, key]) => (
+              <div key={key} className="flex items-center justify-between rounded border border-zinc-800 px-3 py-2">
+                <span className="text-zinc-400">{label}</span>
+                <StatusBadge status={report.necklace_lay?.checks?.[key] || "FAIL"} />
+              </div>
+            ))}
+          </div>
+          <div className="mt-4 grid gap-3 md:grid-cols-2">
+            <Metric
+              label="Overall necklace lay accuracy"
+              value={`${report.necklace_lay.overall_necklace_lay_accuracy_pct.toFixed(1)}%`}
+            />
+            <Metric label="Final result" value={report.necklace_lay.final_result} />
+          </div>
+          {report.necklace_lay.ground_truth_accuracy_pct != null ? (
+            <p className="mt-2 text-zinc-400">
+              Ground-truth accuracy (vs manual reviews): {report.necklace_lay.ground_truth_accuracy_pct.toFixed(1)}%
+            </p>
+          ) : null}
+          {report.necklace_lay.reason ? <p className="mt-2 text-zinc-400">{report.necklace_lay.reason}</p> : null}
+          {report.necklace_lay.note ? <p className="mt-1 text-xs text-zinc-500">{report.necklace_lay.note}</p> : null}
+        </div>
+      ) : null}
       {temporalEntries.length ? (
         <div className="rounded-lg border border-zinc-800 p-4 text-sm">
           <h3 className="mb-3 font-medium text-zinc-200">Temporal stability</h3>
           {temporalEntries.map(([side, summary]) => (
             <div key={side} className="mb-3 last:mb-0">
               <div className="flex items-center justify-between">
-                <p className="capitalize text-zinc-300">{side} ear</p>
+                <p className="capitalize text-zinc-300">{side} {report.jewelry_type === "necklace" ? "neck" : "ear"}</p>
                 <StatusBadge status={summary.status} />
               </div>
               <p className="mt-1 text-zinc-400">

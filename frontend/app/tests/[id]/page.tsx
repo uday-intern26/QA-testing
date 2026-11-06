@@ -37,7 +37,26 @@ export default function TestDetailPage() {
           <div>Application: {test.application_id}</div>
           <div>Reference: {test.reference_id || "none"}</div>
           <div>Jewellery: {test.jewelry_id || "unspecified"} · {test.jewelry_type}</div>
-          <div>Ear side: {test.ear_side}</div>
+          <div>
+            {test.jewelry_type === "earring"
+              ? `Ear side: ${test.ear_side}`
+              : test.jewelry_type === "necklace"
+                ? "Attachment: neck / chest"
+                : `Side: ${test.ear_side}`}
+          </div>
+          <div>
+            Body point:{" "}
+            {test.jewelry_type === "earring"
+              ? "earlobe"
+              : test.jewelry_type === "necklace"
+                ? "neck"
+                : test.jewelry_type === "ring"
+                  ? "finger"
+                  : "wrist"}
+          </div>
+          <div>
+            Pass / fail: {test.pass_threshold} / {test.fail_threshold}
+          </div>
         </dl>
       ) : null}
       {report ? (

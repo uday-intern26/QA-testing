@@ -56,3 +56,15 @@ def get_test(test_id: str, session: Session = Depends(get_db)) -> TestRead:
     if record is None:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Test was not found."})
     return TestRead.model_validate(record, from_attributes=True)
+
+
+@router.delete("/{test_id}", status_code=204)
+def delete_test(
+    test_id: str,
+    session: Session = Depends(get_db),
+    settings: Settings = Depends(get_app_settings),
+) -> None:
+    record = run_repo.get_test(session, test_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Test was not found."})
+    run_repo.delete_test(session, record, data_dir=settings.data_dir)

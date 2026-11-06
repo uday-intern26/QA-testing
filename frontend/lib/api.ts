@@ -20,6 +20,17 @@ export interface ApplicationRecord {
   validation_screenshot: string | null;
 }
 
+export interface CatalogCategory {
+  category: string;
+  items: string[];
+}
+
+export interface CatalogResult {
+  url: string;
+  categories: CatalogCategory[];
+  message: string;
+}
+
 export interface ValidationResult {
   status: "success" | "failed";
   reachable: boolean;
@@ -30,6 +41,7 @@ export interface ValidationResult {
   screenshot_url: string | null;
   application_id: string | null;
   jewelry: string[];
+  catalog?: CatalogCategory[];
 }
 
 export interface ReferenceRecord {
@@ -60,6 +72,7 @@ export interface TestRecord {
   jewelry_id: string | null;
   jewelry_type: string;
   ear_side: "left" | "right" | "both";
+  selected_finger?: "thumb" | "index" | "middle" | "ring" | "little" | null;
   capture_fps: number;
   capture_duration_seconds: number;
   minimum_confidence: number;
@@ -162,9 +175,66 @@ export interface QaReport {
   visual_comparison?: Record<string, unknown>;
   application?: { id: string; name: string; type: string; url: string | null } | null;
   jewelry_id?: string | null;
+  jewelry_type?: string;
   ear_side?: string;
   reference_filename?: string | null;
   frames: FrameRow[];
+  necklace_lay?: {
+    status: string;
+    final_result: string;
+    overall_necklace_lay_accuracy_pct: number;
+    ground_truth_accuracy_pct?: number | null;
+    reason?: string;
+    note?: string;
+    checks: Record<string, string>;
+    accuracies?: Record<string, number>;
+  };
+  earring_lay?: {
+    status: string;
+    final_result: string;
+    overall_earring_lay_accuracy_pct: number;
+    ground_truth_accuracy_pct?: number | null;
+    reason?: string;
+    note?: string;
+    checks: Record<string, string>;
+    accuracies?: Record<string, number>;
+  };
+  selected_finger?: string | null;
+  ring_lay?: {
+    status: string;
+    final_result: string;
+    overall_ring_lay_accuracy_pct: number;
+    ground_truth_accuracy_pct?: number | null;
+    selected_finger?: string;
+    reason?: string;
+    note?: string;
+    checks: Record<string, string>;
+    accuracies?: Record<string, number>;
+  };
+  bracelet_lay?: {
+    status: string;
+    final_result: string;
+    overall_bracelet_lay_accuracy_pct: number;
+    ground_truth_accuracy_pct?: number | null;
+    wrist_side?: string;
+    bracelet_style?: string;
+    reason?: string;
+    note?: string;
+    checks: Record<string, string>;
+    accuracies?: Record<string, number>;
+  };
+  bangle_lay?: {
+    status: string;
+    final_result: string;
+    overall_bangle_lay_accuracy_pct: number;
+    ground_truth_accuracy_pct?: number | null;
+    wrist_side?: string;
+    bangle_count?: number;
+    reason?: string;
+    note?: string;
+    checks: Record<string, string>;
+    accuracies?: Record<string, number>;
+  };
 }
 
 export interface DashboardData {
@@ -229,10 +299,13 @@ export const api = {
   settings: () => request<Record<string, unknown>>("/api/v1/settings"),
   applications: () => request<ApplicationRecord[]>("/api/v1/applications"),
   tryonForm: () => request<{ name: string; url: string; username: string }>("/api/v1/applications/form"),
+  catalog: (body: { url: string; username?: string; password?: string; application_id?: string | null }) =>
+    request<CatalogResult>("/api/v1/applications/catalog", { method: "POST", body: JSON.stringify(body) }),
   createApplication: (body: Record<string, unknown>) =>
     request<ApplicationRecord>("/api/v1/applications", { method: "POST", body: JSON.stringify(body) }),
   updateApplication: (id: string, body: { url?: string; username?: string }) =>
     request<ApplicationRecord>(`/api/v1/applications/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  deleteApplication: (id: string) => request<void>(`/api/v1/applications/${id}`, { method: "DELETE" }),
   uploadFaceVideo: (applicationId: string, file: File) => {
     const form = new FormData();
     form.append("file", file);
@@ -257,6 +330,7 @@ export const api = {
   getTest: (id: string) => request<TestRecord>(`/api/v1/tests/${id}`),
   createTest: (body: Record<string, unknown>) =>
     request<TestRecord>("/api/v1/tests", { method: "POST", body: JSON.stringify(body) }),
+  deleteTest: (id: string) => request<void>(`/api/v1/tests/${id}`, { method: "DELETE" }),
   runTest: (id: string, body: { username?: string; password?: string }) =>
     request<{ test_id: string; test_run_id: string; status: string }>(`/api/v1/tests/${id}/run`, {
       method: "POST",
@@ -265,6 +339,8 @@ export const api = {
   status: (id: string) => request<RunStatus>(`/api/v1/tests/${id}/status`),
   results: (id: string) => request<QaReport>(`/api/v1/tests/${id}/results`),
   runs: () => request<Record<string, unknown>[]>("/api/v1/runs"),
+  deleteRun: (runId: string) => request<void>(`/api/v1/runs/${runId}`, { method: "DELETE" }),
+  clearHistory: () => request<{ deleted_runs: number }>("/api/v1/history", { method: "DELETE" }),
   reviewFrame: (testId: string, frameId: string, body: Record<string, unknown>) =>
     request<Record<string, unknown>>(`/api/v1/tests/${testId}/frames/${frameId}/review`, {
       method: "POST",

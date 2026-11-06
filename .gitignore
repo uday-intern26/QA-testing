@@ -1,4 +1,7 @@
 .env
+.env.local
+frontend/.env.local
+backend/.env
 __pycache__/
 *.py[cod]
 .pytest_cache/

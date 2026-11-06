@@ -16,11 +16,13 @@ import pytest
 
 from app.core.config import get_settings
 from app.db.database import init_db, reset_engine
+from app.services.application_service import ApplicationService
 
 
 @pytest.fixture(autouse=True)
 def isolated_database():
     get_settings.cache_clear()
+    ApplicationService.validated_urls.clear()
     reset_engine()
     if DB_PATH.exists():
         DB_PATH.unlink()

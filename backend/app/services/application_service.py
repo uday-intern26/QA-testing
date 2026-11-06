@@ -13,6 +13,12 @@ from app.schemas.application import ApplicationCreate, ApplicationUpdate
 
 
 class ApplicationService:
+    # The link used for the current validation. It is written to the application after the test.
+    validated_urls: dict[str, str] = {}
+
+    def remember_url(self, application_id: str, url: str) -> None:
+        self.validated_urls[application_id] = url.strip()
+
     def create(self, session: Session, payload: ApplicationCreate) -> Application:
         self._validate_target(payload)
         record = Application(
@@ -41,10 +47,6 @@ class ApplicationService:
         return session.get(Application, application_id)
 
     def update_target(self, session: Session, application: Application, payload: ApplicationUpdate) -> Application:
-        if application.type == "web" and payload.url is not None and not payload.url.strip():
-            raise ValueError("A web application requires a URL.")
-        if payload.url is not None:
-            application.url = payload.url.strip()
         if payload.username is not None:
             application.username = payload.username.strip() or None
         application.updated_at = datetime.now(timezone.utc)
@@ -82,6 +84,56 @@ class ApplicationService:
         session.refresh(application)
         return application
 
+    def save_passed_url(
+        self,
+        session: Session,
+        application: Application,
+        url: str,
+        username: str | None,
+        name: str | None = None,
+    ) -> Application:
+        """Store the try-on link under the name entered for this test."""
+        url = url.strip()
+        given_name = (name or application.name).strip()
+        existing = session.exec(select(Application).where(Application.url == url)).first()
+        if existing is not None:
+            target = existing
+        elif not application.url:
+            target = application
+        else:
+            target = Application(
+                id=allocate_id(session, "APP", Application),
+                name=given_name,
+                type=application.type,
+                url=url,
+                video_path=application.video_path,
+                username=username.strip() if username else application.username,
+                username_selector=application.username_selector,
+                password_selector=application.password_selector,
+                submit_selector=application.submit_selector,
+                ready_selector=application.ready_selector,
+            )
+        target.url = url
+        if given_name:
+            target.name = given_name
+        if username and username.strip():
+            target.username = username.strip()
+        target.updated_at = datetime.now(timezone.utc)
+        session.add(target)
+        session.commit()
+        session.refresh(target)
+        return target
+
+    def save_tested_application(self, session: Session, application_id: str) -> Application | None:
+        """After a placement test, keep the try-on link with the name that was entered."""
+        application = self.get(session, application_id)
+        if application is None or application.type != "web":
+            return None
+        url = self.validated_urls.get(application.id) or application.url or ""
+        if not url.strip():
+            return None
+        return self.save_passed_url(session, application, url, application.username, name=application.name)
+
     def mark_validation(
         self,
         session: Session,
@@ -99,6 +151,21 @@ class ApplicationService:
         session.commit()
         session.refresh(application)
         return application
+
+    def delete(self, session: Session, application: Application, data_dir: Path | None = None) -> None:
+        """Delete an application and cascade its tests and runs."""
+        from app.db.repositories import runs as run_repo
+
+        for test in run_repo.tests_for_application(session, application.id):
+            run_repo.delete_test(session, test, data_dir=data_dir)
+        screenshot = application.validation_screenshot
+        session.delete(application)
+        session.commit()
+        self.validated_urls.pop(application.id, None)
+        if screenshot:
+            path = Path(screenshot)
+            if path.is_file():
+                path.unlink(missing_ok=True)
 
     def _validate_target(self, payload: ApplicationCreate) -> None:
         if payload.type == "web" and not payload.url:
