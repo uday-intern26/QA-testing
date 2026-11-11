@@ -92,7 +92,10 @@ class FallbackEarringAnchorDetector(EarringAnchorDetector):
             matched = self._template_attachment(frame_bgr, earlobe, reference, reference_bgr, side)
             if matched is not None:
                 return matched
-        blob = self._blob_attachment(frame_bgr, earlobe, side)
+        if side == "center" or earlobe.side == "center":
+            blob = self._necklace_blob_attachment(frame_bgr, earlobe, side="center")
+        else:
+            blob = self._blob_attachment(frame_bgr, earlobe, side)
         if blob is not None:
             return blob
         return EarringAnchor(
@@ -196,6 +199,49 @@ class FallbackEarringAnchorDetector(EarringAnchorDetector):
             source="blob",
         )
 
+    def _necklace_blob_attachment(
+        self,
+        frame_bgr: np.ndarray,
+        neck: EarlobeAnchor,
+        side: str = "center",
+    ) -> EarringAnchor | None:
+        """Search a neckline band for gold/bright jewelry instead of an earlobe window."""
+        height, width = frame_bgr.shape[:2]
+        ax = int(neck.x * width)
+        ay = int(neck.y * height)
+        neck_px = max(16.0, neck.ear_width * width)
+        x0 = max(0, ax - int(neck_px * 2.4))
+        x1 = min(width, ax + int(neck_px * 2.4))
+        y0 = max(0, ay - int(neck_px * 0.55))
+        y1 = min(height, ay + int(neck_px * 1.8))
+        crop = frame_bgr[y0:y1, x0:x1]
+        if crop.size == 0:
+            return None
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        value = hsv[:, :, 2].astype(np.int16)
+        local = cv2.blur(value, (15, 15))
+        peak = np.where((value > local + 18) & (hsv[:, :, 1] > 30), 255, 0).astype(np.uint8)
+        gold = cv2.inRange(hsv, (5, 40, 55), (45, 255, 255))
+        neck_local = np.array([ax - x0, ay - y0], dtype=float)
+        gold_hit = self._nearest_contour(gold, neck_local, neck_px, min_area=12, max_scale=4.5)
+        peak_hit = self._nearest_contour(peak, neck_local, neck_px, min_area=6, max_scale=3.5)
+        best = None
+        best_distance = 1e9
+        if gold_hit is not None:
+            best_distance, best = gold_hit
+        elif peak_hit is not None:
+            best_distance, best = peak_hit
+        if best is None or best_distance > neck_px * 2.2:
+            return None
+        return EarringAnchor(
+            side=side,
+            x=float((x0 + best[0]) / width),
+            y=float((y0 + best[1]) / height),
+            confidence=0.72,
+            visible=True,
+            source="blob",
+        )
+
     @staticmethod
     def _nearest_contour(
         mask: np.ndarray,
@@ -230,7 +276,8 @@ def _side_block(state: dict, side: str) -> dict | None:
     keys = {
         "left": ("left", "left_earring", "leftEarring"),
         "right": ("right", "right_earring", "rightEarring"),
-    }[side]
+        "center": ("center", "necklace", "pendant", "middle", "neck"),
+    }.get(side, (side,))
     for key in keys:
         value = state.get(key)
         if isinstance(value, dict):

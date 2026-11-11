@@ -108,11 +108,62 @@ def earlobe_placements(face: FaceLandmarkResult | None, detector: EarlobeDetecto
     return placements
 
 
+def necklace_placements(face: FaceLandmarkResult | None) -> list[dict]:
+    """One necklace sits on the neckline — never on the earlobes."""
+    if face is None or not face.face_detected:
+        return []
+    from app.cv.body_geometry import neck_anchor
+
+    anchor = neck_anchor(face)
+    if anchor is None:
+        return []
+    return [
+        {
+            "side": "center",
+            "x": anchor.x,
+            "y": anchor.y,
+            "ear_width": max(float(anchor.ear_width), 0.14),
+        }
+    ]
+
+
+def body_placements(face: FaceLandmarkResult | None, jewelry_type: str, detector: EarlobeDetector) -> list[dict]:
+    jewelry_type = (jewelry_type or "earring").lower()
+    if jewelry_type == "necklace":
+        return necklace_placements(face)
+    if jewelry_type == "earring":
+        return earlobe_placements(face, detector)
+    from app.cv.body_geometry import body_anchor_for
+
+    side = "center"
+    if jewelry_type in {"bracelet", "bangle", "ring"}:
+        # Prefer a single centered proxy so we do not paint both earlobes.
+        anchor, _error = body_anchor_for(jewelry_type, face, side)
+        if anchor is None:
+            return []
+        return [
+            {
+                "side": anchor.side,
+                "x": anchor.x,
+                "y": anchor.y,
+                "ear_width": max(float(anchor.ear_width), 0.08),
+            }
+        ]
+    return earlobe_placements(face, detector)
+
+
 class LiveJewelryOverlay:
-    def __init__(self, browser, output_dir: Path, settings: Settings | None = None) -> None:
+    def __init__(
+        self,
+        browser,
+        output_dir: Path,
+        settings: Settings | None = None,
+        jewelry_type: str = "earring",
+    ) -> None:
         self.browser = browser
         self.output_dir = output_dir
         self.settings = settings or get_settings()
+        self.jewelry_type = jewelry_type or "earring"
         self.shown = False
         self._detector = EarlobeDetector(self.settings.min_ear_width)
         self._landmarker: MediaPipeFaceLandmarker | None = None
@@ -132,10 +183,10 @@ class LiveJewelryOverlay:
         if landmarker is None:
             return []
         face = landmarker.detect(bgr_to_rgb(read_bgr(frame_path)))
-        return earlobe_placements(face, self._detector)
+        return body_placements(face, self.jewelry_type, self._detector)
 
     async def update(self, frame_path: Path) -> bool:
-        """Hang the selected jewelry on the visible ears. Measurement screenshots stay clean."""
+        """Hang the selected jewelry on the correct body attachment for its type."""
         try:
             return await self._update(frame_path)
         except Exception:
@@ -157,7 +208,12 @@ class LiveJewelryOverlay:
         sprite_path = self.output_dir / "selected_earring.png"
         paint_preview(frame_path, placements, sprite_path, self.output_dir / "live_preview.png")
         sprite = self._sprite()
-        layout = self._layout or {}
+        layout = dict(self._layout or {})
+        if (self.jewelry_type or "").lower() == "necklace":
+            # Necklace spans the neckline; hang the pendant below the attachment.
+            layout["hang"] = True
+            layout["width_ratio"] = max(float(layout.get("width_ratio", 1.0)), 2.6)
+            layout["aspect"] = max(float(layout.get("aspect", 1.0)), 1.15)
         await self.browser.evaluate(
             OVERLAY_SCRIPT,
             {

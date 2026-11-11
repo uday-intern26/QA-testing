@@ -1,8 +1,8 @@
 import cv2
 import numpy as np
 
-from app.cv.types import EarlobeAnchor
-from app.services.live_jewelry_overlay import earlobe_placements, paint_preview, sprite_data_url
+from app.cv.types import EarlobeAnchor, FaceLandmarkResult, Landmark
+from app.services.live_jewelry_overlay import earlobe_placements, necklace_placements, paint_preview, sprite_data_url
 
 
 def test_live_preview_hangs_jewelry_from_the_earlobe(tmp_path):
@@ -53,3 +53,19 @@ def test_overlay_uses_each_detected_earlobe():
     assert earlobe_placements(None, Detector()) == [
         {"side": "left", "x": 0.2, "y": 0.4, "ear_width": 0.05}
     ]
+
+
+def test_necklace_overlay_uses_neck_not_ears():
+    face = FaceLandmarkResult(
+        face_detected=True,
+        confidence=0.95,
+        landmarks=[Landmark(x=0.5, y=0.5) for _ in range(500)],
+    )
+    face.landmarks[152] = Landmark(x=0.5, y=0.7, confidence=0.9)
+    face.landmarks[234] = Landmark(x=0.35, y=0.55)
+    face.landmarks[454] = Landmark(x=0.65, y=0.55)
+    placements = necklace_placements(face)
+    assert len(placements) == 1
+    assert placements[0]["side"] == "center"
+    assert placements[0]["y"] > 0.7
+    assert placements[0]["y"] < 0.95

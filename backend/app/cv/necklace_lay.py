@@ -74,7 +74,9 @@ def neck_geometry(face: FaceLandmarkResult | None, neck: EarlobeAnchor | None) -
     center_x = float(chin.x)
     if left is not None and right is not None:
         center_x = float((left.x + right.x) / 2.0)
-    neckline_y = float(min(0.98, chin.y + face_width * 0.32))
+    neckline_y = float(chin.y + face_width * 0.22)
+    if neckline_y > 0.92:
+        neckline_y = float(min(0.92, chin.y + face_width * 0.12))
     if neck is not None:
         center_x = float(neck.x)
         neckline_y = float(neck.y)
@@ -88,6 +90,9 @@ def neck_geometry(face: FaceLandmarkResult | None, neck: EarlobeAnchor | None) -
     confidence = float(min(face.confidence or 0.9, chin.confidence or 0.9))
     if neck is not None:
         confidence = float(min(confidence, neck.confidence))
+    pendant_y = float(min(0.97, neckline_y + neck_width * 0.75))
+    if pendant_y <= neckline_y + 0.01:
+        pendant_y = float(min(0.97, neckline_y + 0.04))
     return NeckGeometry(
         center_x=center_x,
         center_y=neckline_y,
@@ -97,7 +102,7 @@ def neck_geometry(face: FaceLandmarkResult | None, neck: EarlobeAnchor | None) -
         left_shoulder_x=left_shoulder,
         right_shoulder_x=right_shoulder,
         pendant_x=center_x,
-        pendant_y=float(min(0.98, neckline_y + neck_width * 0.65)),
+        pendant_y=pendant_y,
         face_top_y=float(max(0.01, face_top)),
         confidence=confidence,
     )

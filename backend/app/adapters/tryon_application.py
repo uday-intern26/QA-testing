@@ -59,7 +59,7 @@ class TryOnApplicationAdapter(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    async def select_jewelry(self, jewelry_id: str | None) -> str:
+    async def select_jewelry(self, jewelry_id: str | None, jewelry_type: str | None = None) -> str:
         raise NotImplementedError
 
     @abstractmethod
@@ -111,6 +111,7 @@ class PlaywrightTryOnAdapter(TryOnApplicationAdapter):
         from app.services.live_jewelry_overlay import LiveJewelryOverlay
 
         self.live_overlay = LiveJewelryOverlay(self.browser, output_dir)
+        self.jewelry_type = "earring"
 
     async def connect(self) -> None:
         if not self.application.url:
@@ -339,29 +340,56 @@ class PlaywrightTryOnAdapter(TryOnApplicationAdapter):
         if "No matching jewelry" in text or "Try All Categories" in text:
             await self._click_exact("Show All Category")
 
+    @staticmethod
+    def _catalog_label(jewelry_type: str | None) -> str:
+        return {
+            "earring": "Earrings",
+            "necklace": "Necklaces",
+            "bracelet": "Bracelets",
+            "ring": "Rings",
+            "bangle": "Bangles",
+        }.get((jewelry_type or "earring").lower(), "Earrings")
+
+    @staticmethod
+    def _catalog_name_pattern(jewelry_type: str | None) -> str:
+        return {
+            "earring": "earring",
+            "necklace": "necklace",
+            "bracelet": "bracelet",
+            "ring": "ring",
+            "bangle": "bangle",
+        }.get((jewelry_type or "earring").lower(), "earring")
+
     async def _open_earring_catalog(self) -> None:
-        """Open the catalog. AI Recommendations matches the face photo and is not the test."""
+        await self._open_jewelry_catalog("earring")
+
+    async def _open_jewelry_catalog(self, jewelry_type: str | None) -> None:
+        """Open the catalog for the jewelry type. AI Recommendations is not the test."""
+        label = self._catalog_label(jewelry_type)
+        pattern = self._catalog_name_pattern(jewelry_type)
         for _ in range(40):
             await self._click_exact("Show All Category")
             await self.browser.wait_for_timeout(300)
-            await self._click_exact("Earrings")
+            await self._click_exact(label)
             state = await self.browser.evaluate(
-                """() => {
+                """({ pattern }) => {
                   const text = document.body.innerText || '';
                   const photoMatch = text.includes('No matching jewelry') || text.includes('Try All Categories');
-                  const earrings = [...document.querySelectorAll('img')]
+                  const re = new RegExp(pattern, 'i');
+                  const matches = [...document.querySelectorAll('img')]
                     .map((img) => (img.alt || '').trim())
-                    .filter((alt) => /earring/i.test(alt));
-                  return { photoMatch, count: earrings.length };
-                }"""
+                    .filter((alt) => re.test(alt));
+                  return { photoMatch, count: matches.length };
+                }""",
+                {"pattern": pattern},
             )
             if state and not state.get("photoMatch") and state.get("count", 0) > 0:
                 return
             await self.browser.wait_for_timeout(500)
         raise TryOnError(
-            "The try-on page stayed on photo matching. Catalog earrings were not opened.",
+            f"The try-on page stayed on photo matching. Catalog {label.lower()} were not opened.",
             "JEWELRY_NOT_FOUND",
-            "Use Show All Category, then Earrings. Do not use AI Recommendations.",
+            f"Use Show All Category, then {label}. Do not use AI Recommendations.",
         )
 
     async def _click_exact(self, label: str) -> bool:
@@ -396,22 +424,28 @@ class PlaywrightTryOnAdapter(TryOnApplicationAdapter):
         )
         return bool(clicked)
 
-    async def select_jewelry(self, jewelry_id: str | None) -> str:
+    async def select_jewelry(self, jewelry_id: str | None, jewelry_type: str | None = None) -> str:
+        jewelry_type = (jewelry_type or self.jewelry_type or "earring").lower()
+        self.jewelry_type = jewelry_type
+        self.live_overlay.jewelry_type = jewelry_type
         if await self._is_storefront():
-            return await self._select_storefront_jewelry(jewelry_id)
+            return await self._select_storefront_jewelry(jewelry_id, jewelry_type=jewelry_type)
+        label = self._catalog_label(jewelry_type)
+        pattern = self._catalog_name_pattern(jewelry_type)
         await self._click_exact("Video")
-        await self._open_earring_catalog()
+        await self._open_jewelry_catalog(jewelry_type)
         selected = None
         for _ in range(20):
             selected = await self.browser.evaluate(
-                """async (jewelryId) => {
+                """async ({ jewelryId, pattern }) => {
                   const text = document.body.innerText || '';
                   if (text.includes('No matching jewelry') || text.includes('Try All Categories')) return null;
                   const wanted = (jewelryId || '').trim().toLowerCase();
                   const images = [...document.querySelectorAll('img')].filter((img) => (img.alt || '').trim());
+                  const typeRe = new RegExp(pattern, 'i');
                   const match = wanted
                     ? images.find((img) => (img.alt || '').toLowerCase().includes(wanted))
-                    : images.find((img) => /stud earring/i.test(img.alt || ''));
+                    : images.find((img) => typeRe.test(img.alt || ''));
                   if (!match) return null;
                   match.setAttribute('data-qa-selected-earring', '1');
                   match.scrollIntoView({ block: 'center', inline: 'nearest' });
@@ -435,13 +469,13 @@ class PlaywrightTryOnAdapter(TryOnApplicationAdapter):
                     push(bits[0], Number.isFinite(width) ? width : 0);
                   }
                   sources.sort((a, b) => b.width - a.width);
-                  return { name: match.alt || 'earring', src: sources.length ? sources[0].url : '' };
+                  return { name: match.alt || pattern, src: sources.length ? sources[0].url : '' };
                 }""",
-                jewelry_id or "",
+                {"jewelryId": jewelry_id or "", "pattern": pattern},
             )
             if selected:
                 await self._save_catalog_photo(str(selected.get("src") or ""))
-                selected = selected.get("name") or "earring"
+                selected = selected.get("name") or pattern
                 await self.browser.evaluate(
                     """() => {
                       const match = document.querySelector("img[data-qa-selected-earring='1']");
@@ -452,13 +486,13 @@ class PlaywrightTryOnAdapter(TryOnApplicationAdapter):
                 )
                 break
             await self._click_exact("Show All Category")
-            await self._click_exact("Earrings")
+            await self._click_exact(label)
             await self.browser.wait_for_timeout(500)
         if not selected:
             raise TryOnError(
-                "The catalog earring was not selected. Photo matching was not used.",
+                f"The catalog {pattern} was not selected. Photo matching was not used.",
                 "JEWELRY_NOT_FOUND",
-                "Open Show All Category, choose Earrings, and select the catalog earring.",
+                f"Open Show All Category, choose {label}, and select the catalog item.",
             )
         await self.browser.wait_for_timeout(4000)
         still_matching = await self.browser.evaluate(
@@ -469,13 +503,15 @@ class PlaywrightTryOnAdapter(TryOnApplicationAdapter):
         )
         if still_matching:
             raise TryOnError(
-                "The try-on page stayed on photo matching after the catalog earring was selected.",
+                f"The try-on page stayed on photo matching after the catalog {pattern} was selected.",
                 "JEWELRY_NOT_FOUND",
                 "Leave AI Recommendations closed and keep Show All Category selected.",
             )
-        return f"Selected catalogue earring {selected}."
+        return f"Selected catalogue {pattern} {selected}."
 
-    async def _select_storefront_jewelry(self, jewelry_id: str | None) -> str:
+    async def _select_storefront_jewelry(self, jewelry_id: str | None, jewelry_type: str | None = None) -> str:
+        jewelry_type = (jewelry_type or self.jewelry_type or "earring").lower()
+        pattern = self._catalog_name_pattern(jewelry_type)
         await self.browser.evaluate(
             """() => {
               const close = [...document.querySelectorAll('button')].find(
@@ -487,15 +523,16 @@ class PlaywrightTryOnAdapter(TryOnApplicationAdapter):
         await self.browser.wait_for_timeout(500)
         wanted = (jewelry_id or "").strip().lower()
         selected = await self.browser.evaluate(
-            """(wanted) => {
+            """({ wanted, pattern }) => {
               const cards = [...document.querySelectorAll('article.card')];
+              const typeRe = new RegExp(pattern, 'i');
               const card = wanted
                 ? cards.find((item) => {
                     const name = (item.querySelector('h2')?.innerText || '').trim().toLowerCase();
                     const sku = (item.querySelector('.sku')?.innerText || '').trim().toLowerCase();
                     return name.includes(wanted) || sku.includes(wanted) || wanted.includes(name);
                   })
-                : cards.find((item) => /earring/i.test(item.innerText || '')) || cards[0];
+                : cards.find((item) => typeRe.test(item.innerText || '')) || cards[0];
               if (!card) return null;
               const img = card.querySelector('img');
               if (img) img.setAttribute('data-qa-selected-earring', '1');
@@ -507,7 +544,7 @@ class PlaywrightTryOnAdapter(TryOnApplicationAdapter):
                 src: img ? (img.currentSrc || img.src || '') : '',
               };
             }""",
-            wanted,
+            {"wanted": wanted, "pattern": pattern},
         )
         if not selected:
             raise TryOnError(
@@ -523,7 +560,7 @@ class PlaywrightTryOnAdapter(TryOnApplicationAdapter):
                 "APPLICATION_NOT_READY",
                 "Click Try ON on the chosen jewelry and wait for the camera view.",
             )
-        return f"Selected catalogue earring {selected.get('name') or 'jewelry'}."
+        return f"Selected catalogue {pattern} {selected.get('name') or 'jewelry'}."
 
     async def _save_catalog_photo(self, src: str) -> bool:
         """Keep the catalog product photo so the live try-on shows that earring, not a drawn stand-in."""
@@ -764,7 +801,7 @@ class VideoFileTryOnAdapter(TryOnApplicationAdapter):
     async def launch(self) -> None:
         return None
 
-    async def select_jewelry(self, jewelry_id: str | None) -> str:
+    async def select_jewelry(self, jewelry_id: str | None, jewelry_type: str | None = None) -> str:
         return "Video/file mode does not select jewellery in a live application."
 
     async def capture(self) -> list[RawFrame]:
@@ -809,7 +846,7 @@ class DesktopTryOnAdapter(TryOnApplicationAdapter):
     async def launch(self) -> None:
         await self.connect()
 
-    async def select_jewelry(self, jewelry_id: str | None) -> str:
+    async def select_jewelry(self, jewelry_id: str | None, jewelry_type: str | None = None) -> str:
         await self.connect()
         return ""
 

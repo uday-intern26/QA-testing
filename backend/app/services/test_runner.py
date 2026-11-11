@@ -102,6 +102,7 @@ class TestRunner:
             duration = test.capture_duration_seconds
             fps = test.capture_fps
             jewelry_id = test.jewelry_id
+            jewelry_type = test.jewelry_type or "earring"
 
         adapter = build_tryon_adapter(
             application,
@@ -115,6 +116,10 @@ class TestRunner:
             viewport_height=self.settings.viewport_height,
             timeout_ms=self.settings.navigation_timeout_ms,
         )
+        if getattr(adapter, "live_overlay", None) is not None:
+            adapter.live_overlay.jewelry_type = jewelry_type
+        if hasattr(adapter, "jewelry_type"):
+            adapter.jewelry_type = jewelry_type
         try:
             await adapter.connect()
             with session_scope() as session:
@@ -128,7 +133,7 @@ class TestRunner:
                 auth_detail = "Authentication successful." if app_type == "web" else "Video/file source does not require login."
                 self._set_step(session, run, "authentication", "PASS", auth_detail, 28)
             await adapter.launch()
-            note = await adapter.select_jewelry(jewelry_id)
+            note = await adapter.select_jewelry(jewelry_id, jewelry_type=jewelry_type)
             with session_scope() as session:
                 run = self._require_run(session, run_id)
                 self._set_step(
@@ -139,7 +144,9 @@ class TestRunner:
                     "Showing the selected jewelry on the live video. Pass or fail is decided after this.",
                     40,
                 )
-            frames, capture_note = await self.capture_service.capture(adapter, jewelry_id)
+            frames, capture_note = await self.capture_service.capture(
+                adapter, jewelry_id, jewelry_type=jewelry_type
+            )
             del note
             video_path = getattr(adapter, "video_file", None)
             if video_path:
@@ -286,12 +293,13 @@ class TestRunner:
                     body, body_error = body_anchor_for(jewelry_type, item.face, side)
                 if body is None:
                     missing_earlobe[side] += 1
-                jewelry = self.debug_detector.detect_from_state(item.raw.debug_state, side if side != "center" else "left")
+                detect_side = side if jewelry_type != "necklace" else "center"
+                jewelry = self.debug_detector.detect_from_state(item.raw.debug_state, detect_side)
                 if jewelry is None or not jewelry.visible or jewelry.x is None:
                     jewelry = self.fallback_detector.detect(
                         image,
                         body,
-                        side=side if side != "center" else "left",
+                        side=detect_side,
                         reference=reference_vector if jewelry_type == "earring" else None,
                         reference_bgr=reference_bgr if jewelry_type == "earring" else None,
                     )

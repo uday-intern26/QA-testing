@@ -32,10 +32,14 @@ def neck_anchor(face: FaceLandmarkResult) -> EarlobeAnchor | None:
     center_x = float(chin.x)
     if left is not None and right is not None:
         center_x = float((left.x + right.x) / 2.0)
+    # Prefer a true neckline below the chin. Keep room in-frame for the pendant hang.
+    neckline_y = chin.y + face_width * 0.22
+    if neckline_y > 0.92:
+        neckline_y = min(0.92, chin.y + face_width * 0.12)
     return EarlobeAnchor(
         side="center",
         x=center_x,
-        y=float(min(0.98, chin.y + face_width * 0.32)),
+        y=float(max(0.05, min(0.95, neckline_y))),
         confidence=float(min(face.confidence or 0.9, chin.confidence or 0.9)),
         ear_width=float(face_width * 0.55),
         ear_height=float(face_width * 0.35),

@@ -9,8 +9,16 @@ from app.services.frame_selector import RawFrame
 
 
 class CaptureService:
-    async def capture(self, adapter: TryOnApplicationAdapter, jewelry_id: str | None) -> tuple[list[RawFrame], str]:
-        note = await adapter.select_jewelry(jewelry_id)
+    async def capture(
+        self,
+        adapter: TryOnApplicationAdapter,
+        jewelry_id: str | None,
+        jewelry_type: str | None = None,
+    ) -> tuple[list[RawFrame], str]:
+        note = await adapter.select_jewelry(
+            jewelry_id,
+            jewelry_type=jewelry_type or getattr(adapter, "jewelry_type", None),
+        )
         frames = await adapter.capture()
         return frames, note
 
