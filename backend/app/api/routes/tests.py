@@ -1,3 +1,5 @@
+import json
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session
 
@@ -14,9 +16,20 @@ from app.utils.validators import assert_thresholds
 router = APIRouter(prefix="/tests", tags=["tests"])
 
 
+def _to_read(record: TestDefinition) -> TestRead:
+    read = TestRead.model_validate(record, from_attributes=True)
+    raw = getattr(record, "debug_options_json", None)
+    if raw:
+        try:
+            read.debug_options = json.loads(raw)
+        except json.JSONDecodeError:
+            read.debug_options = None
+    return read
+
+
 @router.get("", response_model=list[TestRead])
 def list_tests(session: Session = Depends(get_db)) -> list[TestRead]:
-    return [TestRead.model_validate(item, from_attributes=True) for item in run_repo.list_tests(session)]
+    return [_to_read(item) for item in run_repo.list_tests(session)]
 
 
 @router.post("", response_model=TestRead, status_code=201)
@@ -38,16 +51,19 @@ def create_test(
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Application was not found."})
     if payload.reference_id and session.get(ReferenceImage, payload.reference_id) is None:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Reference was not found."})
+    data = payload.model_dump()
+    debug_options = data.pop("debug_options", None)
     record = TestDefinition(
         id=allocate_id(session, "TEST", TestDefinition),
-        **payload.model_dump(),
+        **data,
+        debug_options_json=json.dumps(debug_options) if debug_options else None,
     )
     if record.capture_fps == 0:
         record.capture_fps = settings.default_capture_fps
     session.add(record)
     session.commit()
     session.refresh(record)
-    return TestRead.model_validate(record, from_attributes=True)
+    return _to_read(record)
 
 
 @router.get("/{test_id}", response_model=TestRead)
@@ -55,7 +71,7 @@ def get_test(test_id: str, session: Session = Depends(get_db)) -> TestRead:
     record = run_repo.get_test(session, test_id)
     if record is None:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Test was not found."})
-    return TestRead.model_validate(record, from_attributes=True)
+    return _to_read(record)
 
 
 @router.delete("/{test_id}", status_code=204)

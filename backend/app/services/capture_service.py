@@ -14,11 +14,17 @@ class CaptureService:
         adapter: TryOnApplicationAdapter,
         jewelry_id: str | None,
         jewelry_type: str | None = None,
+        *,
+        already_selected: bool = False,
     ) -> tuple[list[RawFrame], str]:
-        note = await adapter.select_jewelry(
-            jewelry_id,
-            jewelry_type=jewelry_type or getattr(adapter, "jewelry_type", None),
-        )
+        # Avoid selecting twice — a second Try ON click stacks a duplicate jewelry item.
+        if already_selected or getattr(adapter, "jewelry_selected", False):
+            note = "Jewellery already selected for capture."
+        else:
+            note = await adapter.select_jewelry(
+                jewelry_id,
+                jewelry_type=jewelry_type or getattr(adapter, "jewelry_type", None),
+            )
         frames = await adapter.capture()
         return frames, note
 

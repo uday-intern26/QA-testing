@@ -135,7 +135,14 @@ async def test_video_pipeline_passes_when_attachment_is_on_the_lobe(tmp_path: Pa
                     "frame_index": index,
                     "jewelry_id": "E123",
                     "jewelry_type": "earring",
-                    "left": {"x": 0.338, "y": 0.604, "visible": True},
+                    "left": {
+                        "x": 0.338,
+                        "y": 0.604,
+                        "visible": True,
+                        "local_x": -0.8,
+                        "local_y": -3.8,
+                        "local_z": -0.4,
+                    },
                 }
                 for index in range(8)
             ]
@@ -172,7 +179,14 @@ async def test_pipeline_fails_when_the_attachment_is_below_the_lobe(tmp_path: Pa
                     "frame_index": index,
                     "jewelry_id": "E123",
                     "jewelry_type": "earring",
-                    "left": {"x": 0.338, "y": 0.92, "visible": True},
+                    "left": {
+                        "x": 0.338,
+                        "y": 0.92,
+                        "visible": True,
+                        "local_x": 2.0,
+                        "local_y": 2.0,
+                        "local_z": 2.0,
+                    },
                 }
                 for index in range(8)
             ]
@@ -186,7 +200,10 @@ async def test_pipeline_fails_when_the_attachment_is_below_the_lobe(tmp_path: Pa
         assert run is not None
         assert run.overall_status == "FAIL"
         reason = (run.reason or "").lower()
-        assert "below" in reason or "placement" in reason or "zone" in reason or "distance" in reason
+        assert any(
+            word in reason
+            for word in ("below", "placement", "zone", "distance", "tracking", "earlobe", "attached")
+        )
         report = json.loads(run.report_json or "{}")
         assert report["layers"]["frame_selection"]["status"] == "PASS"
         assert report["layers"]["anchor_detection"]["status"] == "PASS"

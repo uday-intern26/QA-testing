@@ -211,7 +211,17 @@ def resolve_wrist_geometry(
     debug_state: dict | None,
     side: str,
     style: str,
+    hand_landmarks=None,
 ) -> WristGeometry | None:
+    from app.cv.ring_lay import hand_dict_from_mediapipe
+    from app.cv.types import HandLandmarkResult
+
+    if isinstance(hand_landmarks, HandLandmarkResult):
+        mediapipe_hand = hand_dict_from_mediapipe(hand_landmarks)
+        if mediapipe_hand is not None:
+            geometry = wrist_geometry_from_hand(mediapipe_hand, side, style)
+            if geometry is not None:
+                return geometry
     hand = _hand_from_debug(debug_state, side)
     if hand is not None:
         geometry = wrist_geometry_from_hand(hand, side, style)
@@ -230,6 +240,7 @@ def evaluate_bracelet_lay(
     side: str = "left",
     jewelry_id: str | None = None,
     debug_state: dict | None = None,
+    hand_landmarks=None,
 ) -> dict:
     """
     Measure bracelet lay around the wrist.
@@ -251,6 +262,7 @@ def evaluate_bracelet_lay(
         debug_state=debug_state,
         side=wrist_side,
         style=style,
+        hand_landmarks=hand_landmarks,
     )
     checks: dict[str, dict] = {}
 

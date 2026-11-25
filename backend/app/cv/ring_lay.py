@@ -4,10 +4,34 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from app.cv.types import EarlobeAnchor, EarringAnchor, FaceLandmarkResult, PlacementMeasurement
+from app.cv.types import EarlobeAnchor, EarringAnchor, FaceLandmarkResult, HandLandmarkResult, Landmark, PlacementMeasurement
 from app.utils.geometry import distance, normalize_distance, offset
 
 FINGER_NAMES = ("thumb", "index", "middle", "ring", "little")
+
+# MediaPipe Hands landmark indices used to build named finger geometry.
+_MP_WRIST = 0
+_MP_POINTS: dict[str, int] = {
+    "wrist": 0,
+    "thumb_mcp": 2,
+    "thumb_ip": 3,
+    "thumb_tip": 4,
+    "index_mcp": 5,
+    "index_pip": 6,
+    "index_tip": 8,
+    "middle_mcp": 9,
+    "middle_pip": 10,
+    "middle_tip": 12,
+    "ring_mcp": 13,
+    "ring_pip": 14,
+    "ring_tip": 16,
+    "little_mcp": 17,
+    "little_pip": 18,
+    "little_tip": 20,
+    "pinky_mcp": 17,
+    "pinky_pip": 18,
+    "pinky_tip": 20,
+}
 
 # Relative placement along a hand-proxy axis (0=wrist/base, 1=fingertip).
 FINGER_SLOT = {
@@ -93,6 +117,33 @@ def _hand_from_debug(debug_state: dict | None) -> dict | None:
             if isinstance(first, dict):
                 return first
     return None
+
+
+def _xy(landmarks: list[Landmark], index: int) -> tuple[float, float] | None:
+    if index < 0 or index >= len(landmarks):
+        return None
+    point = landmarks[index]
+    return float(point.x), float(point.y)
+
+
+def hand_dict_from_mediapipe(hand: HandLandmarkResult | None) -> dict | None:
+    """Convert MediaPipe HandLandmarkResult into the named-point dict used by finger_geometry_from_hand."""
+    if hand is None or not hand.hand_detected or not hand.landmarks:
+        return None
+    payload: dict = {
+        "confidence": float(hand.confidence or 0.85),
+        "handedness": hand.handedness,
+        "source": "mediapipe",
+    }
+    wrist = _xy(hand.landmarks, _MP_WRIST)
+    if wrist is not None:
+        payload["wrist"] = {"x": wrist[0], "y": wrist[1]}
+        payload["palm"] = {"x": wrist[0], "y": wrist[1]}
+    for name, index in _MP_POINTS.items():
+        point = _xy(hand.landmarks, index)
+        if point is not None:
+            payload[name] = {"x": point[0], "y": point[1]}
+    return payload
 
 
 def _finger_point(hand: dict, names: tuple[str, ...]) -> tuple[float, float] | None:
@@ -250,7 +301,14 @@ def resolve_finger_geometry(
     face: FaceLandmarkResult | None,
     debug_state: dict | None,
     side: str,
+    hand_landmarks: HandLandmarkResult | None = None,
 ) -> FingerGeometry | None:
+    # Prefer live MediaPipe landmarks from frame selection over debug/proxy guesses.
+    mediapipe_hand = hand_dict_from_mediapipe(hand_landmarks)
+    if mediapipe_hand is not None:
+        geometry = finger_geometry_from_hand(mediapipe_hand, selected_finger)
+        if geometry is not None:
+            return geometry
     hand = _hand_from_debug(debug_state)
     if hand is not None:
         geometry = finger_geometry_from_hand(hand, selected_finger)
@@ -269,6 +327,7 @@ def evaluate_ring_lay(
     selected_finger: str = "ring",
     side: str = "left",
     debug_state: dict | None = None,
+    hand_landmarks: HandLandmarkResult | None = None,
 ) -> dict:
     """
     Measure ring lay around the selected finger.
@@ -288,6 +347,7 @@ def evaluate_ring_lay(
         face=face,
         debug_state=debug_state,
         side=side if side in {"left", "right"} else "left",
+        hand_landmarks=hand_landmarks,
     )
     checks: dict[str, dict] = {}
 
@@ -331,7 +391,17 @@ def evaluate_ring_lay(
             "finger": finger,
         }
 
-    jewelry_ok = bool(jewelry and jewelry.visible and jewelry.x is not None and jewelry.y is not None)
+    jewelry_source = str(getattr(jewelry, "source", "") or "").lower() if jewelry else "missing"
+    jewelry_confidence = float(getattr(jewelry, "confidence", 0.0) or 0.0) if jewelry else 0.0
+    # Weak pixel guesses must not count as a placed ring (same rule as earring tracking).
+    weak_guess = jewelry_source in {"blob", "template", "missing"} and jewelry_confidence < 0.85
+    jewelry_ok = bool(
+        jewelry
+        and jewelry.visible
+        and jewelry.x is not None
+        and jewelry.y is not None
+        and not weak_guess
+    )
     if not jewelry_ok or geometry is None:
         fail = {
             "status": "FAIL",

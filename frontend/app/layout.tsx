@@ -5,8 +5,8 @@ import { Shell } from "@/components/Shell";
 import { ThemeProvider } from "@/components/ThemeProvider";
 
 export const metadata: Metadata = {
-  title: "AIJewel QA",
-  description: "Unified AIJewel QA console for virtual try-on and contract-driven agentic API testing.",
+  title: "AIJewel QA · Jewelry Try-On",
+  description: "AIJewel QA console for jewelry try-on placement testing.",
 };
 
 const themeBootScript = `

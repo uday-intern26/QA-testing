@@ -1,23 +1,36 @@
 import json
 from pathlib import Path
 
-import cv2
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse
 from sqlmodel import Session, select
 
 from app.api.dependencies import get_app_settings, get_db
 from app.core.config import Settings
-from app.cv.visualization import composite_catalog_earring, draw_placed_earring
+from app.cv.debug_config import DEBUG_PROFILES
 from app.db.repositories import runs as run_repo
 from app.models.application import Application
 from app.models.frame import FrameResult
 from app.models.result import TestRun
 from app.schemas.result import DashboardSummary, FramePlacement
 from app.schemas.test import ManualReviewRequest
-from app.utils.files import ensure_within_data
+from app.utils.files import StorageError, ensure_within_data
 
 router = APIRouter(tags=["results"])
+
+
+def _existing_frame_file(*candidates: str | None) -> Path | None:
+    """Return the first frame file that is still on disk inside the data directory."""
+    for raw in candidates:
+        if not raw:
+            continue
+        try:
+            path = ensure_within_data(Path(raw))
+        except StorageError:
+            continue
+        if path.is_file():
+            return path
+    return None
 
 
 def _latest(session: Session, test_id: str) -> TestRun:
@@ -29,6 +42,20 @@ def _latest(session: Session, test_id: str) -> TestRun:
     return run
 
 
+def _debug_frame_path(settings: Settings, run_id: str, frame_number, side: str | None) -> Path | None:
+    """Debug overlays are written only while Debug Mode is on, so this may be absent."""
+    if frame_number is None or not side:
+        return None
+    path = (
+        settings.data_dir
+        / "results"
+        / run_id
+        / "debug_frames"
+        / f"frame_{int(frame_number):04d}_{side}.png"
+    )
+    return path if path.is_file() else None
+
+
 def _frame_view(session: Session, test_id: str, frame: FrameResult, settings: Settings) -> dict:
     payload = json.loads(frame.result_json)
     record = run_repo.get_frame(session, frame.frame_id)
@@ -36,6 +63,9 @@ def _frame_view(session: Session, test_id: str, frame: FrameResult, settings: Se
     annotated_url = None
     if record and record.annotated_path:
         annotated_url = f"{image_url}?variant=annotated"
+    debug_url = None
+    if _debug_frame_path(settings, frame.test_run_id, payload.get("frame_number"), frame.side) is not None:
+        debug_url = f"{image_url}?variant=debug&side={frame.side}"
     placement = payload.get("placement") or {}
     return {
         "frame_id": frame.frame_id,
@@ -59,8 +89,27 @@ def _frame_view(session: Session, test_id: str, frame: FrameResult, settings: Se
         "review_reason": frame.review_reason,
         "image_url": image_url,
         "annotated_image_url": annotated_url,
+        "debug_image_url": debug_url,
         "zone": payload.get("zone"),
         "earring_source": (payload.get("earring") or {}).get("source"),
+        "jewelry_category": payload.get("jewelry_category"),
+        "detected_body_parts": payload.get("detected_body_parts") or [],
+        "required_body_parts": payload.get("required_body_parts") or [],
+        "body_confidence": payload.get("body_confidence"),
+        "frame_quality_score": payload.get("frame_quality_score"),
+        "selection_status": payload.get("selection_status"),
+        "rejection_reasons": payload.get("rejection_reasons") or [],
+        "rejection_sources": payload.get("rejection_sources") or {},
+        "jewelry_diagnostics": payload.get("jewelry_diagnostics"),
+        "landmark_validation": payload.get("landmark_validation"),
+        "failure_reason": payload.get("failure_reason"),
+        "landmarks_url": f"{settings.api_prefix}/tests/{test_id}/frames/{frame.frame_id}/landmarks",
+        "matching_score": payload.get("matching_score"),
+        "placement_accuracy": payload.get("placement_accuracy"),
+        "placement_rank": payload.get("placement_rank"),
+        "best_match": bool(payload.get("best_match")),
+        "top_match": bool(payload.get("top_match")),
+        "tracing_points_valid": bool(payload.get("tracing_points_valid")),
     }
 
 
@@ -206,41 +255,59 @@ def frame_detail(
     }
 
 
+@router.get("/tests/{test_id}/frames/{frame_id}/landmarks")
+def frame_landmarks(
+    test_id: str,
+    frame_id: str,
+    session: Session = Depends(get_db),
+    settings: Settings = Depends(get_app_settings),
+) -> dict:
+    """Runtime MediaPipe landmarks for one frame, used by the debug overlay."""
+    run = _latest(session, test_id)
+    frame = run_repo.get_frame(session, frame_id)
+    if frame is None or frame.test_run_id != run.id:
+        raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Frame was not found."})
+    path = settings.data_dir / "results" / run.id / "landmarks" / f"frame_{frame.frame_number:04d}.json"
+    if not path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "LANDMARKS_UNAVAILABLE",
+                "message": "No landmarks were stored for this frame. Re-run the test to capture them.",
+            },
+        )
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 @router.get("/tests/{test_id}/frames/{frame_id}/image")
 def frame_image(
     test_id: str,
     frame_id: str,
     variant: str = "original",
+    side: str | None = None,
     session: Session = Depends(get_db),
+    settings: Settings = Depends(get_app_settings),
 ) -> FileResponse:
     run = _latest(session, test_id)
     frame = run_repo.get_frame(session, frame_id)
     if frame is None or frame.test_run_id != run.id:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Frame was not found."})
+    if variant == "debug":
+        debug_path = _debug_frame_path(settings, run.id, frame.frame_number, side)
+        if debug_path is None:
+            raise HTTPException(
+                status_code=404,
+                detail={"code": "NOT_FOUND", "message": "No debug frame exists. Re-run the test with Debug Mode on."},
+            )
+        return FileResponse(debug_path, headers={"Cache-Control": "no-store"})
     raw = frame.annotated_path if variant == "annotated" and frame.annotated_path else frame.path
-    path = ensure_within_data(Path(raw))
-    if not path.is_file():
+    path = _existing_frame_file(raw, frame.annotated_path, frame.path)
+    if path is None:
         raise HTTPException(status_code=404, detail={"code": "NOT_FOUND", "message": "Frame image is missing."})
-    image = cv2.imread(str(path), cv2.IMREAD_COLOR)
-    if image is None:
-        return FileResponse(path)
-    for item in run_repo.results_for_frame(session, frame_id):
-        payload = json.loads(item.result_json or "{}")
-        anchor = (payload.get("earring") or {}).get("anchor") or payload.get("earring_anchor")
-        if not anchor or anchor.get("x") is None or anchor.get("y") is None:
-            continue
-        zone = payload.get("zone") or {}
-        ear = payload.get("ear") or {}
-        ear_width = zone.get("ear_width") or ear.get("ear_width")
-        sprite = Path(frame.path).resolve().parent.parent / "selected_earring.png"
-        if sprite.is_file():
-            image = composite_catalog_earring(image, sprite, float(anchor["x"]), float(anchor["y"]), ear_width)
-        else:
-            image = draw_placed_earring(image, float(anchor["x"]), float(anchor["y"]), ear_width)
-    encoded, buffer = cv2.imencode(".png", image)
-    if not encoded:
-        return FileResponse(path)
-    return Response(content=buffer.tobytes(), media_type="image/png", headers={"Cache-Control": "no-store"})
+    # Serve the captured / annotated frame as-is. The try-on AR already drew the jewelry;
+    # compositing the catalog sprite here created a second oversized earring on every frame.
+    media = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+    return FileResponse(path, media_type=media, headers={"Cache-Control": "no-store"})
 
 
 @router.post("/tests/{test_id}/frames/{frame_id}/review")
@@ -306,10 +373,12 @@ def settings_view(settings: Settings = Depends(get_app_settings)) -> dict:
         "applitools_enabled": settings.applitools_enabled,
         "applitools_configured": bool(settings.applitools_api_key),
         "face_model_present": settings.resolved_face_model_path.is_file(),
+        "hand_model_present": settings.resolved_hand_model_path.is_file(),
         "overlay": {
             "earlobe": settings.overlay_earlobe_color,
             "earring": settings.overlay_earring_color,
             "zone": settings.overlay_zone_color,
             "vector": settings.overlay_vector_color,
         },
+        "debug_profiles": {key: profile.as_dict() for key, profile in DEBUG_PROFILES.items()},
     }

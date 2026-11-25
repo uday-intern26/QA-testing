@@ -15,9 +15,16 @@ from app.core.config import Settings
 from app.core.logging import log_event
 from app.core.security import secret_registry
 from app.cv.anchor_geometry import reference_vector_from_points
+from app.cv.debug_config import debug_profile_for
+from app.cv.debug_landmarks import contour_indices, selected_landmark_index, uses_hand_landmarks
+from app.cv.debug_overlay import render_debug_frame
+from app.cv.landmark_validation import FrameValidation, evaluate_frame, summarize_validation
 from app.cv.face_landmarks import FaceLandmarkError, MediaPipeFaceLandmarker
-from app.cv.image_processing import bgr_to_rgb
-from app.cv.types import FaceLandmarkResult, PlacementMeasurement, ReferenceVector
+from app.cv.hand_landmarks import HandLandmarkError, MediaPipeHandLandmarker
+from app.cv.image_processing import bgr_to_rgb, read_bgr
+from app.cv.jewelry_presence import frame_wears_jewelry
+from app.cv.jewelry_profiles import profile_for
+from app.cv.types import FaceLandmarkResult, HandLandmarkResult, PlacementMeasurement, ReferenceVector
 from app.cv.visualization import OverlayPalette, annotate_frame, save_image
 from app.db.database import session_scope
 from app.db.repositories import runs as run_repo
@@ -26,6 +33,7 @@ from app.models.reference import ReferenceImage
 from app.models.result import PlacementResultRow, ReportRow, TestRun
 from app.models.test import TestDefinition
 from app.services.capture_service import CaptureService
+from app.services.frame_review import apply_frame_review
 from app.services.comparison_service import ComparisonService
 from app.services.earlobe_detector import EarlobeDetector
 from app.services.earring_detector import DebugStateEarringDetector, FallbackEarringAnchorDetector
@@ -35,9 +43,61 @@ from app.cv.necklace_lay import aggregate_necklace_lay, evaluate_necklace_lay, m
 from app.cv.bangle_lay import aggregate_bangle_lay, evaluate_bangle_lay, measurement_from_bangle_lay
 from app.cv.bracelet_lay import aggregate_bracelet_lay, evaluate_bracelet_lay, measurement_from_bracelet_lay
 from app.cv.ring_lay import aggregate_ring_lay, evaluate_ring_lay, measurement_from_ring_lay
+from app.cv.tryon_placement_rules import (
+    EUCLIDEAN_PASS,
+    EUCLIDEAN_WARNING,
+    aggregate_placement_panel,
+    validate_earring_side,
+    validate_necklace_frame,
+)
 from app.services.placement_validator import validator_for
 from app.services.report_service import ReportService
 from app.services.temporal_validator import combine_statuses, summarize_temporal
+
+def anchor_diagnostics(debug_state: dict | None) -> dict:
+    """Per-frame record of how far the jewelry anchor pipeline got.
+
+    The stages mirror the try-on data flow: the page publishes a QA bridge, or the
+    scene probe reads the GLB transform, or neither and we say which step stopped.
+    """
+    if not isinstance(debug_state, dict):
+        return {
+            "anchor_source": "unavailable",
+            "anchor_stage": "NO_DEBUG_STATE",
+            "detail": "The try-on page published no QA bridge and no scene was readable.",
+        }
+    scene = debug_state.get("scene_diagnostics") if isinstance(debug_state.get("scene_diagnostics"), dict) else {}
+    raw_source = debug_state.get("anchor_source")
+    if not raw_source or str(raw_source).lower() in {"unavailable", "none", "null"}:
+        anchor_source = "qa_overlay" if debug_state.get("qa_overlay") else None
+    else:
+        anchor_source = raw_source
+    stage = debug_state.get("anchor_stage")
+    has_anchor = any(
+        isinstance(debug_state.get(key), dict) and debug_state[key].get("x") is not None
+        for key in ("left", "right", "center", "necklace", "ring", "bracelet", "bangle", "jewelry", "attachment")
+    )
+    if not stage:
+        if has_anchor:
+            stage = "ANCHOR_AVAILABLE"
+            if not anchor_source:
+                anchor_source = "debug_bridge"
+        else:
+            stage = "NO_ANCHOR_IN_DEBUG_STATE"
+            if not anchor_source:
+                anchor_source = "unavailable"
+    return {
+        "anchor_source": anchor_source or "unavailable",
+        "anchor_stage": stage,
+        "qa_status": debug_state.get("qa_status"),
+        "glb_loaded": scene.get("glb_loaded"),
+        "mesh_visible": scene.get("mesh_visible"),
+        "transform_computed": scene.get("transform_computed"),
+        "camera_found": scene.get("camera_found"),
+        "anchor_projected": scene.get("anchor_projected"),
+        "notes": list(scene.get("notes") or []),
+    }
+
 
 WAITING_STEPS = [
     "application",
@@ -104,6 +164,9 @@ class TestRunner:
             jewelry_id = test.jewelry_id
             jewelry_type = test.jewelry_type or "earring"
 
+        from app.services.browser_service import release_live_tryon
+
+        await release_live_tryon()
         adapter = build_tryon_adapter(
             application,
             username=username,
@@ -120,6 +183,10 @@ class TestRunner:
             adapter.live_overlay.jewelry_type = jewelry_type
         if hasattr(adapter, "jewelry_type"):
             adapter.jewelry_type = jewelry_type
+        adapter.min_capture_frames = self.settings.min_capture_frames
+        adapter.target_capture_frames = self.settings.target_capture_frames
+        adapter.capture_timeout_seconds = self.settings.capture_timeout_seconds
+        adapter.jewelry_appear_timeout_seconds = self.settings.jewelry_appear_timeout_seconds
         try:
             await adapter.connect()
             with session_scope() as session:
@@ -134,6 +201,7 @@ class TestRunner:
                 self._set_step(session, run, "authentication", "PASS", auth_detail, 28)
             await adapter.launch()
             note = await adapter.select_jewelry(jewelry_id, jewelry_type=jewelry_type)
+            settle_seconds = float(getattr(self.settings, "jewelry_settle_seconds", 15) or 15)
             with session_scope() as session:
                 run = self._require_run(session, run_id)
                 self._set_step(
@@ -141,11 +209,17 @@ class TestRunner:
                     run,
                     "capture",
                     "RUNNING",
-                    "Showing the selected jewelry on the live video. Pass or fail is decided after this.",
+                    (
+                        f"Waiting until the jewelry is on the girl video, then {settle_seconds:.0f}s settle, "
+                        "then capturing frames. Pass or fail is decided after this."
+                    ),
                     40,
                 )
             frames, capture_note = await self.capture_service.capture(
-                adapter, jewelry_id, jewelry_type=jewelry_type
+                adapter,
+                jewelry_id,
+                jewelry_type=jewelry_type,
+                already_selected=True,
             )
             del note
             video_path = getattr(adapter, "video_file", None)
@@ -161,17 +235,12 @@ class TestRunner:
                     session.commit()
             with session_scope() as session:
                 run = self._require_run(session, run_id)
-                overlay_note = (
-                    "Selected jewelry was shown on the live video. "
-                    if getattr(adapter, "live_overlay", None) and adapter.live_overlay.shown
-                    else ""
-                )
                 self._set_step(
                     session,
                     run,
                     "capture",
                     "PASS",
-                    f"{overlay_note}{capture_note} Captured {len(frames)} frames.",
+                    f"{capture_note} Captured {len(frames)} frames from the try-on AR (no QA overlay).",
                     55,
                 )
             log_event("CAPTURE_COMPLETED", test_run_id=run_id, frames=len(frames), url=app_url)
@@ -201,6 +270,8 @@ class TestRunner:
             test_name = test.name
             jewelry_id = test.jewelry_id
             ear_side = test.ear_side
+            debug_mode = bool(getattr(test, "debug_mode", False))
+            debug_overrides = self._debug_overrides(test)
             output_dir = self.settings.data_dir / "results" / run.id
             output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -211,6 +282,7 @@ class TestRunner:
                 "Increase the capture duration or confirm the try-on view is visible.",
             )
 
+        category = profile_for(jewelry_type)
         selector = FrameSelector(
             min_blur_variance=self.settings.min_blur_variance,
             blur_norm_variance=self.settings.blur_norm_variance,
@@ -220,21 +292,47 @@ class TestRunner:
             min_ear_width=self.settings.min_ear_width,
             minimum_confidence=config["minimum_confidence"],
             ear_side=ear_side if jewelry_type == "earring" else "left",
-            require_ear_visibility=jewelry_type == "earring",
+            jewelry_type=jewelry_type,
         )
         faces = self._detect_faces(raw_frames)
-        evaluated = selector.evaluate(raw_frames, faces)
-        selected = selector.select(evaluated, config["max_selected_frames"])
-        selected_ids = {frame.raw.index for frame in selected}
-        layer1 = "PASS" if len(selected) >= config["min_selected_frames"] else "FAIL"
-        layer1_detail = (
-            f"{len(selected)} representative frames selected from {len(raw_frames)} captured."
-            if layer1 == "PASS"
-            else (
-                f"Only {len(selected)} frames passed quality checks; "
-                f"{config['min_selected_frames']} are required."
+        hands = self._detect_hands(raw_frames) if category.requires_hand else None
+        evaluated = selector.evaluate(raw_frames, faces, hands=hands)
+        needed = int(config["min_selected_frames"])
+        worn = [frame for frame in evaluated if self._frame_wears_jewelry(frame, jewelry_type)]
+        body_ok = [frame for frame in evaluated if selector._has_required_body(frame.quality)]
+        # Measure every captured frame. Tracing-point distance, not sharpness, picks the best ones.
+        selected = list(evaluated)
+        selected_ids = {frame.raw.index for frame in evaluated}
+        for frame in evaluated:
+            frame.quality.selection_status = "measured"
+        layer1 = "PASS" if len(body_ok) >= needed or len(worn) >= needed else "FAIL"
+        required_parts = ", ".join(category.required_body_parts)
+        usable_count = len(body_ok) if body_ok else len(worn)
+        rejected_count = max(0, len(raw_frames) - usable_count)
+        if layer1 == "PASS":
+            layer1_detail = (
+                f"{len(raw_frames)} frames captured after the jewelry was laid "
+                f"({usable_count} with the required body: {required_parts}). "
+                "The closest tracing-point matches are ranked after placement."
             )
-        )
+        else:
+            missing_counts: dict[str, int] = {}
+            for frame in evaluated:
+                detected = set(frame.quality.detected_body_parts or [])
+                for part in category.required_body_parts:
+                    if part not in detected:
+                        missing_counts[part] = missing_counts.get(part, 0) + 1
+            missing_hint = (
+                "; most common missing: "
+                + ", ".join(f"{part} ({count})" for part, count in sorted(missing_counts.items(), key=lambda item: -item[1])[:3])
+                if missing_counts
+                else ""
+            )
+            layer1_detail = (
+                f"Only {len(body_ok)} frames showed the required body ({required_parts}); "
+                f"{needed} are required"
+                f"{missing_hint}."
+            )
         log_event("FRAME_SELECTION_COMPLETED", test_run_id=run_id, selected=len(selected), captured=len(raw_frames))
         with session_scope() as session:
             run = self._require_run(session, run_id)
@@ -265,6 +363,10 @@ class TestRunner:
         ring_frame_lays: list[dict] = []
         bracelet_frame_lays: list[dict] = []
         bangle_frame_lays: list[dict] = []
+        placement_panel_frames: list[dict] = []
+        debug_profile = debug_profile_for(jewelry_type, debug_overrides)
+        landmark_validations: dict[str, list[FrameValidation]] = {side: [] for side in sides}
+        debug_frame_paths: list[dict] = []
 
         with session_scope() as session:
             run = self._require_run(session, run_id)
@@ -290,21 +392,36 @@ class TestRunner:
                 if jewelry_type == "earring":
                     body, body_error = earlobe_detector.detect(item.face, side)
                 else:
-                    body, body_error = body_anchor_for(jewelry_type, item.face, side)
+                    body, body_error = body_anchor_for(
+                        jewelry_type,
+                        item.face,
+                        side,
+                        hand=getattr(item, "hand", None),
+                        selected_finger=selected_finger,
+                    )
                 if body is None:
                     missing_earlobe[side] += 1
                 detect_side = side if jewelry_type != "necklace" else "center"
                 jewelry = self.debug_detector.detect_from_state(item.raw.debug_state, detect_side)
                 if jewelry is None or not jewelry.visible or jewelry.x is None:
-                    jewelry = self.fallback_detector.detect(
-                        image,
-                        body,
+                    debug_state = item.raw.debug_state if isinstance(item.raw.debug_state, dict) else {}
+                    diagnostics = anchor_diagnostics(debug_state)
+                    from app.cv.types import EarringAnchor
+
+                    # Do not invent attachment coordinates from skin highlights. When the
+                    # try-on never published an anchor, report that explicitly.
+                    stage = diagnostics.get("anchor_stage") or "ATTACHMENT_ANCHOR_MISSING"
+                    jewelry = EarringAnchor(
                         side=detect_side,
-                        reference=reference_vector if jewelry_type == "earring" else None,
-                        reference_bgr=reference_bgr if jewelry_type == "earring" else None,
+                        source="missing",
+                        visible=False,
+                        confidence=0.0,
+                        reason=(
+                            f"{jewelry_type.capitalize()} attachment was not published "
+                            f"({stage}). QA will not invent coordinates from the pixels."
+                        ),
                     )
-                    if jewelry.x is None:
-                        missing_earring[side] += 1
+                    missing_earring[side] += 1
                 measurement = validator.validate(body, jewelry, config=config)
                 necklace_lay = None
                 ring_lay = None
@@ -332,6 +449,7 @@ class TestRunner:
                         selected_finger=selected_finger,
                         side=side if side in {"left", "right"} else "left",
                         debug_state=item.raw.debug_state if isinstance(item.raw.debug_state, dict) else None,
+                        hand_landmarks=getattr(item, "hand", None),
                     )
                     measurement = measurement_from_ring_lay(ring_lay, measurement)
                     ring_frame_lays.append(ring_lay)
@@ -344,6 +462,7 @@ class TestRunner:
                         side=side if side in {"left", "right"} else "left",
                         jewelry_id=jewelry_id,
                         debug_state=item.raw.debug_state if isinstance(item.raw.debug_state, dict) else None,
+                        hand_landmarks=getattr(item, "hand", None),
                     )
                     measurement = measurement_from_bracelet_lay(bracelet_lay, measurement)
                     bracelet_frame_lays.append(bracelet_lay)
@@ -356,6 +475,7 @@ class TestRunner:
                         side=side if side in {"left", "right"} else "left",
                         jewelry_id=jewelry_id,
                         debug_state=item.raw.debug_state if isinstance(item.raw.debug_state, dict) else None,
+                        hand_landmarks=getattr(item, "hand", None),
                     )
                     measurement = measurement_from_bangle_lay(bangle_lay, measurement)
                     bangle_frame_lays.append(bangle_lay)
@@ -388,14 +508,132 @@ class TestRunner:
                 )
                 earring_frame_lays.append(earring_lay)
                 updated_side_results = []
+                panel_row: dict = {
+                    "frame_number": item.raw.index,
+                    "timestamp_ms": item.raw.timestamp_ms,
+                    "head_angle_deg": None,
+                }
                 for side, body, jewelry, measurement, body_error, necklace_lay, ring_lay, bracelet_lay, bangle_lay in side_results:
                     side_meas = measurement_from_earring_lay(earring_lay, side, measurement)
+                    panel_side = validate_earring_side(
+                        side,
+                        item.face,
+                        body,
+                        jewelry,
+                        required=side in sides,
+                        pass_threshold=float(config.get("pass_threshold", EUCLIDEAN_PASS)),
+                        fail_threshold=float(config.get("fail_threshold", EUCLIDEAN_WARNING)),
+                    )
+                    panel_row[side] = panel_side
+                    panel_row["head_angle_deg"] = panel_side.get("head_angle_deg")
+                    # Prefer landmark-relative panel status; never upgrade FAIL/WARNING to PASS.
+                    if panel_side.get("status") in {"FAIL", "WARNING", "NOT_TESTABLE"}:
+                        # Keep the diagnostic "attachment was not published" reason when the
+                        # try-on never sent coordinates — the pass-tracking copy is less useful.
+                        missing_anchor = (
+                            jewelry is None
+                            or not jewelry.visible
+                            or jewelry.x is None
+                            or str(jewelry.source or "").lower() == "missing"
+                        )
+                        if missing_anchor and jewelry is not None and jewelry.reason:
+                            reason = jewelry.reason
+                        else:
+                            reason = panel_side.get("reason") or side_meas.reason
+                        side_meas = side_meas.model_copy(
+                            update={
+                                "status": panel_side["status"],
+                                "reason": reason,
+                                "normalized_distance": panel_side.get("placement_error", side_meas.normalized_distance),
+                            }
+                        )
                     per_side_statuses[side][-1] = side_meas.status
                     per_side_measurements[side][-1] = side_meas
                     updated_side_results.append(
                         (side, body, jewelry, side_meas, body_error, necklace_lay, ring_lay, bracelet_lay, bangle_lay)
                     )
                 side_results = updated_side_results
+                placement_panel_frames.append(panel_row)
+            elif jewelry_type == "necklace" and side_results:
+                side, body, jewelry, measurement, body_error, necklace_lay, ring_lay, bracelet_lay, bangle_lay = side_results[0]
+                left_jewel = self.debug_detector.detect_from_state(item.raw.debug_state, "left")
+                right_jewel = self.debug_detector.detect_from_state(item.raw.debug_state, "right")
+                panel_row = validate_necklace_frame(
+                    item.face,
+                    body,
+                    jewelry,
+                    left_jewelry=left_jewel,
+                    right_jewelry=right_jewel,
+                    pass_threshold=float(config.get("pass_threshold", EUCLIDEAN_PASS)),
+                    fail_threshold=float(config.get("fail_threshold", EUCLIDEAN_WARNING)),
+                )
+                panel_row = {
+                    **panel_row,
+                    "frame_number": item.raw.index,
+                    "timestamp_ms": item.raw.timestamp_ms,
+                }
+                placement_panel_frames.append(panel_row)
+                if panel_row.get("status") in {"FAIL", "WARNING", "NOT_TESTABLE"} and necklace_lay is not None:
+                    measurement = measurement.model_copy(
+                        update={
+                            "status": panel_row["status"],
+                            "reason": panel_row.get("reason") or measurement.reason,
+                            "normalized_distance": panel_row.get("placement_error", measurement.normalized_distance),
+                        }
+                    )
+                    per_side_statuses[side][-1] = measurement.status
+                    per_side_measurements[side][-1] = measurement
+                    side_results = [
+                        (side, body, jewelry, measurement, body_error, necklace_lay, ring_lay, bracelet_lay, bangle_lay)
+                    ]
+
+            frame_size = (int(image.shape[1]), int(image.shape[0]))
+            diagnostics = anchor_diagnostics(item.raw.debug_state)
+            frame_validations: dict[str, FrameValidation] = {}
+            for side, body, jewelry, _meas, *_rest in side_results:
+                landmark_index = selected_landmark_index(jewelry_type, side, selected_finger)
+                validation = evaluate_frame(
+                    frame_number=item.raw.index,
+                    timestamp_ms=item.raw.timestamp_ms,
+                    side=side,
+                    profile=debug_profile,
+                    face=item.face,
+                    hand=getattr(item, "hand", None),
+                    expected=body,
+                    jewelry=jewelry,
+                    frame_size=frame_size,
+                    landmark_index=landmark_index,
+                    diagnostics=diagnostics,
+                )
+                landmark_validations.setdefault(side, []).append(validation)
+                frame_validations[side] = validation
+                if not debug_mode:
+                    continue
+                debug_canvas = render_debug_frame(
+                    image,
+                    profile=debug_profile,
+                    validation=validation,
+                    face=item.face,
+                    hand=getattr(item, "hand", None),
+                    expected=body,
+                    jewelry=jewelry,
+                    contour_indices=contour_indices(jewelry_type, side),
+                    selected_landmark_index=landmark_index,
+                    selected_landmark_source="hand" if uses_hand_landmarks(jewelry_type) else "face",
+                )
+                debug_path = output_dir / "debug_frames" / f"frame_{item.raw.index:04d}_{side}.png"
+                save_image(debug_path, debug_canvas)
+                debug_frame_paths.append(
+                    {
+                        "frame_number": item.raw.index,
+                        "side": side,
+                        "status": validation.status,
+                        "failure_reason": validation.failure_reason,
+                        "path": str(debug_path),
+                    }
+                )
+
+            self._write_frame_landmarks(output_dir, item, jewelry_type, selected_finger, sides)
 
             annotated_path = output_dir / "annotated_frames" / f"frame_{item.raw.index:04d}.png"
             save_image(annotated_path, annotated)
@@ -417,9 +655,55 @@ class TestRunner:
                     ring_lay=ring_lay,
                     bracelet_lay=bracelet_lay,
                     bangle_lay=bangle_lay,
+                    validation=frame_validations.get(side),
                 )
                 frame_payloads.append(payload)
                 self._persist_frame_result(run_id, item, payload)
+
+        order = self._rank_placement_frames(frame_payloads, top_n=5)
+        top_numbers = set(order[:5])
+        self._persist_ranking(run_id, frame_payloads, top_numbers)
+        if layer1 == "PASS" and order:
+            by_index = {frame.raw.index: frame for frame in evaluated}
+            selected = [by_index[number] for number in order[:5] if number in by_index]
+            for frame in evaluated:
+                frame.quality.selection_status = "selected" if frame.raw.index in top_numbers else "measured"
+            analyzed_order = [frame.raw.index for frame in evaluated]
+            index_of = {number: index for index, number in enumerate(analyzed_order)}
+            keep_indexes = [index_of[number] for number in sorted(top_numbers) if number in index_of]
+
+            def _take(items: list) -> list:
+                return [items[index] for index in keep_indexes if index < len(items)]
+
+            for side in sides:
+                per_side_statuses[side] = _take(per_side_statuses[side])
+                per_side_measurements[side] = _take(per_side_measurements[side])
+                landmark_validations[side] = _take(landmark_validations.get(side, []))
+            earring_frame_lays = _take(earring_frame_lays)
+            necklace_frame_lays = _take(necklace_frame_lays)
+            ring_frame_lays = _take(ring_frame_lays)
+            bracelet_frame_lays = _take(bracelet_frame_lays)
+            bangle_frame_lays = _take(bangle_frame_lays)
+            placement_panel_frames = _take(placement_panel_frames)
+            missing_earlobe = {side: 0 for side in sides}
+            missing_earring = {side: 0 for side in sides}
+            for payload in frame_payloads:
+                if payload.get("frame_number") not in top_numbers:
+                    continue
+                side = payload.get("side")
+                if side not in missing_earlobe:
+                    continue
+                if not payload.get("earlobe_detected"):
+                    missing_earlobe[side] += 1
+                if not payload.get("earring_detected"):
+                    missing_earring[side] += 1
+            layer1_detail = (
+                f"Top {len(selected)} frames ranked by tracing-point distance "
+                f"from {len(raw_frames)} captured."
+            )
+            with session_scope() as session:
+                run = self._require_run(session, run_id)
+                self._set_step(session, run, "frame_selection", layer1, layer1_detail, 68)
 
         log_event("EARLOBE_DETECTION_COMPLETED", test_run_id=run_id)
         log_event("EARRING_DETECTION_COMPLETED", test_run_id=run_id)
@@ -556,7 +840,106 @@ class TestRunner:
                 action = "Review bangle frames for tilt, uneven multi-bangle spacing, or partial wrist visibility."
             elif bangle_lay_summary.get("final_result") == "PASS" and overall in {"PASS", "WARNING"}:
                 reason = bangle_lay_summary.get("reason") or reason
-        statistics = self._statistics(len(raw_frames), len(evaluated), selected, temporal, sides)
+        closest_frames = apply_frame_review(
+            frame_payloads,
+            float(config["pass_threshold"]),
+            float(config["fail_threshold"]),
+            limit=10,
+        )
+        statistics = self._statistics(
+            len(raw_frames),
+            len(evaluated),
+            selected,
+            temporal,
+            sides,
+            jewelry_type=jewelry_type,
+            output_dir=output_dir,
+        )
+        statistics["frames_usable"] = usable_count
+        statistics["frames_rejected"] = rejected_count
+        statistics["near_pass_frames"] = sum(1 for frame in frame_payloads if frame.get("review_label") == "NEAR_PASS")
+        measured = [frame.get("normalized_distance") for frame in frame_payloads if isinstance(frame.get("normalized_distance"), (int, float))]
+        statistics["best_placement_distance"] = round(min(measured), 4) if measured else None
+        grouped_scores: dict[int, list[float]] = {}
+        grouped_valid: dict[int, bool] = {}
+        grouped_detected: dict[int, bool] = {}
+        for payload in frame_payloads:
+            number = int(payload.get("frame_number") or 0)
+            grouped_scores.setdefault(number, []).append(float(payload.get("matching_score") or 0.0))
+            grouped_valid[number] = grouped_valid.get(number, True) and bool(payload.get("tracing_points_valid"))
+            detected = bool(payload.get("earlobe_detected") or payload.get("earring_detected"))
+            grouped_detected[number] = grouped_detected.get(number, False) or detected
+        valid_scores = [sum(scores) / len(scores) for number, scores in grouped_scores.items() if grouped_valid.get(number)]
+        statistics["frames_detected"] = sum(1 for number, flag in grouped_detected.items() if flag)
+        statistics["frames_with_tracing_points"] = len(valid_scores)
+        statistics["average_tracing_accuracy"] = round(100.0 * sum(valid_scores) / len(valid_scores), 1) if valid_scores else 0.0
+        statistics["best_frame_number"] = order[0] if order else None
+        statistics["top_frame_numbers"] = order[:5]
+        landmark_validation = {
+            "enabled": True,
+            "debug_mode": debug_mode,
+            "enforced": debug_mode,
+            "profile": debug_profile.as_dict(),
+            "sides": {
+                side: summarize_validation(landmark_validations.get(side, []), debug_profile)
+                for side in sides
+            },
+            "debug_frames": debug_frame_paths,
+            "failed_debug_frames": [
+                entry for entry in debug_frame_paths if entry["status"] == "FAIL"
+            ],
+        }
+        side_overalls = [
+            landmark_validation["sides"][side]["overall_status"] for side in sides
+        ]
+        landmark_validation["overall_status"] = combine_statuses(side_overalls) if side_overalls else "NOT_TESTABLE"
+        landmark_validation["failure_reason"] = next(
+            (
+                landmark_validation["sides"][side]["failure_reason"]
+                for side in sides
+                if landmark_validation["sides"][side]["failure_reason"]
+            ),
+            None,
+        )
+        placement_validation_panel = None
+        if jewelry_type in {"earring", "necklace"} and placement_panel_frames:
+            placement_validation_panel = aggregate_placement_panel(
+                jewelry_type=jewelry_type,
+                frame_panels=placement_panel_frames,
+            )
+            panel_overall = placement_validation_panel.get("overall_status")
+            if panel_overall == "FAIL":
+                overall = "FAIL"
+                reason = next(
+                    (
+                        str(component.get("reason"))
+                        for component in (placement_validation_panel.get("components") or {}).values()
+                        if isinstance(component, dict) and component.get("status") == "FAIL" and component.get("reason")
+                    ),
+                    reason,
+                )
+                action = "Reposition the jewellery so every visible attachment stays within the pass tolerance."
+            elif panel_overall == "WARNING" and overall == "PASS":
+                overall = "WARNING"
+                reason = "Placement is between the pass and fail Euclidean thresholds."
+            elif panel_overall == "NOT_TESTABLE" and overall == "PASS":
+                overall = "NOT_TESTABLE"
+                reason = "Required ear or necklace anchors were not visible / not testable."
+            summary = placement_validation_panel.get("summary") or {}
+            statistics = {
+                **statistics,
+                "frames_passed": summary.get("passed_frames", statistics.get("frames_passed")),
+                "frames_warning": summary.get("warning_frames", statistics.get("frames_warning")),
+                "frames_failed": summary.get("failed_frames", statistics.get("frames_failed")),
+                "frames_not_testable": summary.get("not_testable_frames", 0),
+                "testable_frames": summary.get("testable_frames", statistics.get("frames_selected")),
+                "pass_percentage": summary.get("pass_percentage"),
+                "earring_accuracy": summary.get("earring_accuracy"),
+                "necklace_accuracy": summary.get("necklace_accuracy"),
+                "pass_rate": (summary.get("pass_percentage", 0) / 100.0)
+                if summary.get("pass_percentage") is not None
+                else statistics.get("pass_rate"),
+            }
         report = {
             "test_run_id": run_id,
             "test_id": test_id,
@@ -581,6 +964,8 @@ class TestRunner:
                 "minimum_confidence": config["minimum_confidence"],
                 "maximum_consecutive_failures": config["maximum_consecutive_failures"],
                 "zone_y_scale": config["zone_y_scale"],
+                "euclidean_pass": EUCLIDEAN_PASS,
+                "euclidean_fail": EUCLIDEAN_WARNING,
             },
             "reference_comparison": reference_report,
             "temporal": {side: temporal[side].__dict__ for side in sides},
@@ -589,8 +974,41 @@ class TestRunner:
             "ear_side": ear_side,
             "reference_filename": reference_filename,
             "frames": frame_payloads,
+            "closest_frames": [
+                {
+                    "frame_number": frame.get("frame_number"),
+                    "status": frame.get("status"),
+                    "review_label": frame.get("review_label"),
+                    "normalized_distance": frame.get("normalized_distance"),
+                    "placement_gap": frame.get("placement_gap"),
+                    "pass_threshold": frame.get("pass_threshold"),
+                    "fail_threshold": frame.get("fail_threshold"),
+                    "reason": frame.get("reason"),
+                    "body_confidence": frame.get("body_confidence"),
+                    "earring_confidence": frame.get("earring_confidence"),
+                    "earlobe": frame.get("earlobe"),
+                    "earring_anchor": frame.get("earring_anchor"),
+                }
+                for frame in closest_frames
+            ],
             "rejection_summary": self._rejection_summary(evaluated),
+            "rejection_sources": self._rejection_sources(evaluated),
         }
+        report["landmark_validation"] = landmark_validation
+        # Debug Mode OFF keeps the landmark results report-only so the existing
+        # customer-facing verdict is unchanged; ON makes them authoritative.
+        if debug_mode and landmark_validation["overall_status"] == "FAIL":
+            overall = "FAIL"
+            reason = self._landmark_failure_reason(landmark_validation) or reason
+            action = (
+                "Open the debug frames for the failing frames and correct the attachment "
+                "offset, rotation, or scale that the landmark validation reported."
+            )
+            report["overall_status"] = overall
+            report["reason"] = reason
+            report["recommended_action"] = action
+        if placement_validation_panel is not None:
+            report["placement_validation"] = placement_validation_panel
         if necklace_lay_summary is not None:
             report["necklace_lay"] = necklace_lay_summary
         if earring_lay_summary is not None:
@@ -666,6 +1084,28 @@ class TestRunner:
                 close()
         return faces
 
+    def _detect_hands(self, raw_frames: list[RawFrame]) -> list[HandLandmarkResult]:
+        provider = MediaPipeHandLandmarker(self.settings.resolved_hand_model_path)
+        hands: list[HandLandmarkResult] = []
+        try:
+            for frame in raw_frames:
+                from app.cv.image_processing import read_bgr
+
+                image = read_bgr(frame.path)
+                hands.append(provider.detect(bgr_to_rgb(image)))
+        except HandLandmarkError as exc:
+            # Soft-fail hand model issues into empty detections so reports stay usable.
+            log_event("HAND_LANDMARKER_UNAVAILABLE", error=str(exc))
+            return [
+                HandLandmarkResult(hand_detected=False, reason="hand_landmarker_unavailable")
+                for _ in raw_frames
+            ]
+        finally:
+            close = getattr(provider, "close", None)
+            if close:
+                close()
+        return hands
+
     def _persist_frame_row(self, run_id: str, item: SelectedFrame, selected_ids: set[int]) -> None:
         rejected = bool(item.quality.rejection_reasons) or item.raw.index not in selected_ids
         reasons = list(item.quality.rejection_reasons)
@@ -727,7 +1167,9 @@ class TestRunner:
         ring_lay: dict | None = None,
         bracelet_lay: dict | None = None,
         bangle_lay: dict | None = None,
+        validation: FrameValidation | None = None,
     ) -> dict:
+        quality = getattr(item, "quality", None)
         payload = {
             "frame_number": item.raw.index,
             "timestamp_ms": item.raw.timestamp_ms,
@@ -761,7 +1203,12 @@ class TestRunner:
             "earlobe_detected": earlobe is not None,
             "earring_detected": bool(earring and earring.x is not None and earring.visible),
             "earlobe_confidence": earlobe.confidence if earlobe else None,
-            "earring_confidence": earring.confidence if earring else None,
+            # Missing jewelry is "not measured", never a fake 0.00 detection score.
+            "earring_confidence": (
+                float(earring.confidence)
+                if earring is not None and earring.x is not None and earring.visible
+                else None
+            ),
             "normalized_distance": measurement.normalized_distance,
             "dx": measurement.dx,
             "dy": measurement.dy,
@@ -770,7 +1217,23 @@ class TestRunner:
             "zone": None
             if earlobe is None
             else {"ear_width": earlobe.ear_width, "ear_height": earlobe.ear_height},
+            "jewelry_category": getattr(quality, "jewelry_category", None),
+            "detected_body_parts": list(getattr(quality, "detected_body_parts", []) or []),
+            "required_body_parts": list(getattr(quality, "required_body_parts", []) or []),
+            "body_confidence": getattr(quality, "body_confidence", None),
+            "frame_quality_score": getattr(quality, "quality_score", None),
+            "selection_status": getattr(quality, "selection_status", None),
+            "rejection_reasons": list(getattr(quality, "rejection_reasons", []) or []),
+            "rejection_sources": dict(getattr(quality, "rejection_sources", {}) or {}),
+            "jewelry_diagnostics": anchor_diagnostics(item.raw.debug_state),
+            "failure_reason": (
+                validation.failure_reason
+                if validation is not None and validation.failure_reason
+                else self._placement_failure_reason(measurement, earring, item.raw.debug_state)
+            ),
         }
+        if validation is not None:
+            payload["landmark_validation"] = validation.to_dict()
         if necklace_lay is not None:
             payload["necklace_lay"] = necklace_lay
         if earring_lay is not None:
@@ -821,10 +1284,17 @@ class TestRunner:
         config = kwargs["config"]
         jewelry_type = kwargs.get("jewelry_type") or "earring"
         if layer1 == "FAIL":
+            body_hint = {
+                "earring": "face and ear",
+                "necklace": "face and neck",
+                "ring": "hand and fingers",
+                "bracelet": "hand and wrist",
+                "bangle": "hand and wrist",
+            }.get(jewelry_type, "required body region")
             return (
                 "FAIL",
-                f"Insufficient frames. {selected_count} representative frames were selected.",
-                "Improve face and ear visibility, reduce blur, or lower the capture motion.",
+                f"Insufficient frames for {jewelry_type}. {selected_count} representative frames were selected.",
+                f"Ensure the {body_hint} are clearly visible, reduce blur, or lower capture motion.",
             )
         chunks = []
         body_name = "earlobe" if jewelry_type == "earring" else ("neck" if jewelry_type == "necklace" else f"{jewelry_type} body")
@@ -930,12 +1400,188 @@ class TestRunner:
             )
         return ("FAIL", reason, action)
 
-    def _statistics(self, captured, analyzed, selected, temporal, sides) -> dict:
+    def _frame_wears_jewelry(self, frame: SelectedFrame, jewelry_type: str) -> bool:
+        image = frame.image_bgr
+        if image is None:
+            try:
+                image = read_bgr(frame.raw.path)
+            except (OSError, ValueError):
+                image = None
+        state = frame.raw.debug_state if isinstance(frame.raw.debug_state, dict) else None
+        return frame_wears_jewelry(image, jewelry_type, state)
+
+    @staticmethod
+    def _matching_score(payload: dict) -> float:
+        """Higher is a closer jewelry-to-body match. Image sharpness is not part of the score."""
+        if not payload.get("earlobe_detected") or not payload.get("earring_detected"):
+            return 0.0
+        distance = payload.get("normalized_distance")
+        if not isinstance(distance, (int, float)):
+            return 0.0
+        closeness = 1.0 / (1.0 + float(distance) * 8.0)
+        visibility = min(1.0, float(payload.get("earring_confidence") or 0.0))
+        body = min(1.0, float(payload.get("earlobe_confidence") or payload.get("body_confidence") or 0.0))
+        return closeness * 0.8 + visibility * 0.1 + body * 0.1
+
+    @staticmethod
+    def _rank_placement_frames(payloads: list[dict], top_n: int = 5) -> list[int]:
+        """Rank frame numbers from closest tracing-point match to worst. Mutates each payload."""
+        grouped: dict[int, dict] = {}
+        for payload in payloads:
+            number = int(payload.get("frame_number") or 0)
+            bucket = grouped.setdefault(
+                number,
+                {"scores": [], "distances": [], "sides": [], "timestamp_ms": payload.get("timestamp_ms") or 0},
+            )
+            bucket["scores"].append(TestRunner._matching_score(payload))
+            bucket["sides"].append(payload)
+            distance = payload.get("normalized_distance")
+            if (
+                payload.get("earlobe_detected")
+                and payload.get("earring_detected")
+                and isinstance(distance, (int, float))
+            ):
+                bucket["distances"].append(float(distance))
+        ranked = sorted(
+            grouped.items(),
+            key=lambda item: (
+                0 if item[1]["distances"] and len(item[1]["distances"]) == len(item[1]["sides"]) else 1,
+                max(item[1]["distances"]) if item[1]["distances"] else 999.0,
+                -(sum(item[1]["scores"]) / len(item[1]["scores"])),
+                int(item[1]["timestamp_ms"] or 0),
+            ),
+        )
+        order = [number for number, _bucket in ranked]
+        top = set(order[:top_n])
+        best = order[0] if order else None
+        for number, bucket in grouped.items():
+            score = sum(bucket["scores"]) / len(bucket["scores"])
+            valid = bool(bucket["distances"]) and len(bucket["distances"]) == len(bucket["sides"])
+            rank = order.index(number) + 1
+            for payload in bucket["sides"]:
+                payload["matching_score"] = round(score, 4)
+                payload["placement_accuracy"] = round(score * 100.0, 1)
+                payload["placement_rank"] = rank
+                payload["best_match"] = number == best
+                payload["top_match"] = number in top
+                payload["tracing_points_valid"] = valid
+        return order
+
+    def _persist_ranking(self, run_id: str, payloads: list[dict], top_numbers: set[int]) -> None:
+        from app.models.frame import FrameResult
+
+        with session_scope() as session:
+            for payload in payloads:
+                result_id = f"{self._frame_id(run_id, payload['frame_number'])}-{payload['side']}"
+                row = session.get(FrameResult, result_id)
+                if row is None:
+                    continue
+                row.result_json = json.dumps(payload)
+                row.normalized_distance = payload.get("normalized_distance")
+                session.add(row)
+            for frame in run_repo.frames_for_run(session, run_id):
+                frame.selected = frame.frame_number in top_numbers
+                session.add(frame)
+            session.commit()
+
+    @staticmethod
+    def _best_frames(frames: list[SelectedFrame], count: int) -> list[SelectedFrame]:
+        ranked = sorted(
+            frames,
+            key=lambda frame: (
+                -(float(getattr(frame.quality, "quality_score", 0.0) or 0.0)),
+                -(float(getattr(frame.quality, "body_confidence", 0.0) or 0.0)),
+                frame.raw.timestamp_ms,
+            ),
+        )
+        chosen: list[SelectedFrame] = []
+        seen: set[int] = set()
+        for frame in ranked:
+            if frame.raw.index in seen:
+                continue
+            seen.add(frame.raw.index)
+            chosen.append(frame)
+            if len(chosen) >= count:
+                break
+        return chosen
+
+    def _even_frames(frames: list[SelectedFrame], count: int) -> list[SelectedFrame]:
+        if len(frames) <= count:
+            return list(frames)
+        last = len(frames) - 1
+        chosen: list[SelectedFrame] = []
+        seen: set[int] = set()
+        for slot in range(count):
+            position = round(slot * last / (count - 1)) if count > 1 else 0
+            frame = frames[position]
+            if frame.raw.index in seen:
+                continue
+            seen.add(frame.raw.index)
+            chosen.append(frame)
+        if len(chosen) < count:
+            for frame in frames:
+                if frame.raw.index not in seen:
+                    chosen.append(frame)
+                    seen.add(frame.raw.index)
+                if len(chosen) >= count:
+                    break
+        return chosen
+
+    def _capture_plan(self, output_dir: Path | None) -> dict:
+        plan = {
+            "minimum_required_frames": self.settings.min_capture_frames,
+            "target_frames": self.settings.target_capture_frames,
+        }
+        if output_dir is None:
+            return plan
+        path = output_dir / "capture_plan.json"
+        if not path.is_file():
+            plan["minimum_required_frames"] = None
+            return plan
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return plan
+        if isinstance(payload, dict):
+            plan.update({key: payload[key] for key in ("minimum_required_frames", "target_frames", "blank_dropped") if key in payload})
+        return plan
+
+    def _jewelry_lay_seconds(self, output_dir: Path) -> float | None:
+        path = output_dir / "jewelry_lay.json"
+        if not path.is_file():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        seconds = payload.get("seconds") if isinstance(payload, dict) else None
+        if isinstance(seconds, (int, float)):
+            return round(float(seconds), 1)
+        return None
+
+    def _statistics(
+        self,
+        captured,
+        analyzed,
+        selected,
+        temporal,
+        sides,
+        *,
+        jewelry_type: str = "earring",
+        output_dir: Path | None = None,
+    ) -> dict:
         passed = sum(temporal[side].passed_frames for side in sides)
         warnings = sum(temporal[side].warning_frames for side in sides)
         failed = sum(temporal[side].failed_frames for side in sides)
-        total = sum(temporal[side].total_frames for side in sides)
+        not_testable = sum(getattr(temporal[side], "not_testable_frames", 0) for side in sides)
+        testable = passed + warnings + failed
         rates = [temporal[side].pass_rate for side in sides]
+        category = profile_for(jewelry_type)
+        body_hits = 0
+        for frame in selected:
+            quality = getattr(frame, "quality", None)
+            if quality and set(category.required_body_parts).issubset(set(quality.detected_body_parts or [])):
+                body_hits += 1
         return {
             "frames_captured": captured,
             "frames_analyzed": analyzed,
@@ -943,10 +1589,114 @@ class TestRunner:
             "frames_passed": passed,
             "frames_warning": warnings,
             "frames_failed": failed,
-            "pass_rate": (passed / total) if total else 0.0,
+            "frames_not_testable": not_testable,
+            "testable_frames": testable,
+            "pass_rate": (passed / testable) if testable else 0.0,
+            "pass_percentage": round(100.0 * passed / testable, 1) if testable else 0.0,
             "max_consecutive_failures": max(temporal[side].max_consecutive_failures for side in sides) if sides else 0,
             "side_pass_rates": {side: rates[index] for index, side in enumerate(sides)},
+            "jewelry_type": category.jewelry_type,
+            "required_body_parts": list(category.required_body_parts),
+            "body_parts_detected_frames": body_hits,
+            "frames_rejected": max(0, analyzed - len(selected)),
+            "frames_usable": analyzed,
+            "jewelry_lay_seconds": self._jewelry_lay_seconds(output_dir) if output_dir else None,
+            **self._capture_plan(output_dir),
         }
+
+    def _config(self, test: TestDefinition) -> dict:
+        jewelry_type = (getattr(test, "jewelry_type", None) or "earring").lower()
+        pass_threshold = test.pass_threshold
+        fail_threshold = test.fail_threshold
+        # Earring / necklace default to Euclidean bands from the placement spec.
+        if jewelry_type in {"earring", "necklace"}:
+            if pass_threshold is None or pass_threshold >= 0.08:
+                pass_threshold = EUCLIDEAN_PASS
+            if fail_threshold is None or fail_threshold >= 0.12:
+                fail_threshold = EUCLIDEAN_WARNING
+        return {
+            "minimum_confidence": test.minimum_confidence,
+            "pass_threshold": pass_threshold,
+            "fail_threshold": fail_threshold,
+            "minimum_pass_rate": test.minimum_pass_rate,
+            "maximum_consecutive_failures": test.maximum_consecutive_failures,
+            "zone_y_scale": test.zone_y_scale,
+            "min_selected_frames": test.min_selected_frames,
+            "max_selected_frames": test.max_selected_frames,
+            "selected_finger": getattr(test, "selected_finger", None) or "ring",
+        }
+
+    @staticmethod
+    def _write_frame_landmarks(output_dir, item, jewelry_type: str, selected_finger: str, sides) -> None:
+        """Persist the runtime landmarks so the UI can draw the real mesh, not a stand-in."""
+        from app.cv.debug_landmarks import contour_indices, selected_landmark_index, uses_hand_landmarks
+
+        face = getattr(item, "face", None)
+        hand = getattr(item, "hand", None)
+        payload: dict = {
+            "frame_number": item.raw.index,
+            "jewelry_type": jewelry_type,
+            "uses_hand_landmarks": uses_hand_landmarks(jewelry_type),
+            "face": [],
+            "hand": [],
+            "contours": {},
+            "selected_landmarks": {},
+        }
+        if face is not None and face.face_detected and face.landmarks:
+            payload["face"] = [[round(p.x, 5), round(p.y, 5)] for p in face.landmarks]
+        if hand is not None and getattr(hand, "hand_detected", False) and hand.landmarks:
+            payload["hand"] = [[round(p.x, 5), round(p.y, 5)] for p in hand.landmarks]
+        for side in sides:
+            contour = contour_indices(jewelry_type, side)
+            if contour:
+                payload["contours"][side] = list(contour)
+            index = selected_landmark_index(jewelry_type, side, selected_finger)
+            if index is not None:
+                payload["selected_landmarks"][side] = index
+        path = output_dir / "landmarks" / f"frame_{item.raw.index:04d}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    @staticmethod
+    def _debug_overrides(test: TestDefinition) -> dict | None:
+        raw = getattr(test, "debug_options_json", None)
+        if not raw:
+            return None
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    @staticmethod
+    def _landmark_failure_reason(landmark_validation: dict) -> str | None:
+        for side, summary in (landmark_validation.get("sides") or {}).items():
+            if summary.get("overall_status") != "FAIL":
+                continue
+            for name, check in (summary.get("checks") or {}).items():
+                if check.get("status") == "FAIL":
+                    return f"[{summary.get('failure_reason')}] {side}: {check.get('detail')}"
+        return None
+
+    @staticmethod
+    def _placement_failure_reason(measurement: PlacementMeasurement, earring, debug_state) -> str | None:
+        """Map a frame measurement onto an explicit failure code for the UI."""
+        from app.cv.landmark_validation import (
+            ATTACHMENT_ANCHOR_MISSING,
+            LANDMARK_NOT_DETECTED,
+            NORMALIZED_DISTANCE_EXCEEDED,
+            reason_for_missing_anchor,
+        )
+
+        if measurement.status not in {"FAIL", "NOT_TESTABLE"}:
+            return None
+        if measurement.earlobe_confidence == 0 and "missing" in (measurement.reason or "").lower():
+            return LANDMARK_NOT_DETECTED
+        if earring is None or earring.x is None or not earring.visible:
+            return reason_for_missing_anchor(anchor_diagnostics(debug_state if isinstance(debug_state, dict) else None))
+        if measurement.normalized_distance is not None:
+            return NORMALIZED_DISTANCE_EXCEEDED
+        return ATTACHMENT_ANCHOR_MISSING
 
     def _layer2_status(self, sides, missing_earlobe, missing_earring, selected_count) -> str:
         if selected_count == 0:
@@ -965,8 +1715,8 @@ class TestRunner:
         parts = []
         for side in sides:
             parts.append(
-                f"{side} earlobe misses {missing_earlobe[side]}/{selected_count}, "
-                f"earring misses {missing_earring[side]}/{selected_count}."
+                f"{side} body misses {missing_earlobe[side]}/{selected_count}, "
+                f"jewelry misses {missing_earring[side]}/{selected_count}."
             )
         return " ".join(parts)
 
@@ -976,6 +1726,24 @@ class TestRunner:
             for reason in frame.quality.rejection_reasons:
                 counts[reason] = counts.get(reason, 0) + 1
         return counts
+
+    @staticmethod
+    def _rejection_sources(evaluated: list[SelectedFrame]) -> dict[str, dict[str, int]]:
+        """Rejections grouped by the stage that produced them.
+
+        Frames dropped by duplicate filtering or candidate selection are skipped,
+        not failed, so they are never counted as placement failures.
+        """
+        from app.services.frame_selector import rejection_source
+
+        grouped: dict[str, dict[str, int]] = {}
+        for frame in evaluated:
+            sources = getattr(frame.quality, "rejection_sources", {}) or {}
+            for reason in frame.quality.rejection_reasons:
+                stage = sources.get(reason) or rejection_source(reason)
+                bucket = grouped.setdefault(stage, {})
+                bucket[reason] = bucket.get(reason, 0) + 1
+        return grouped
 
     def _vector_from_reference(self, reference: ReferenceImage | None) -> ReferenceVector | None:
         if reference is None or None in {
@@ -996,19 +1764,6 @@ class TestRunner:
             reference.ear_height,
             self.settings.default_zone_y_scale,
         )
-
-    def _config(self, test: TestDefinition) -> dict:
-        return {
-            "minimum_confidence": test.minimum_confidence,
-            "pass_threshold": test.pass_threshold,
-            "fail_threshold": test.fail_threshold,
-            "minimum_pass_rate": test.minimum_pass_rate,
-            "maximum_consecutive_failures": test.maximum_consecutive_failures,
-            "zone_y_scale": test.zone_y_scale,
-            "min_selected_frames": test.min_selected_frames,
-            "max_selected_frames": test.max_selected_frames,
-            "selected_finger": getattr(test, "selected_finger", None) or "ring",
-        }
 
     def _set_step(
         self,

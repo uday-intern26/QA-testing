@@ -57,8 +57,17 @@ def annotate_frame(
 
     if earring and earring.x is not None and earring.y is not None:
         earring_point = (int(earring.x * width), int(earring.y * height))
-        cv2.line(canvas, center, earring_point, palette.vector, 2)
-        cv2.circle(canvas, earring_point, 6, palette.earring, -1)
+        if normalized_distance is None or not math_isfinite(normalized_distance):
+            status_color = palette.zone
+        elif normalized_distance <= pass_threshold:
+            status_color = palette.inner_zone
+        elif normalized_distance <= fail_threshold:
+            status_color = hex_to_bgr("#eab308")
+        else:
+            status_color = palette.zone
+        cv2.line(canvas, center, earring_point, status_color, 2)
+        cv2.circle(canvas, earring_point, 8, status_color, 2)
+        cv2.circle(canvas, earring_point, 5, palette.earring, -1)
         if normalized_distance is not None and math_isfinite(normalized_distance):
             label_x = int((center[0] + earring_point[0]) / 2) + 8
             label_y = int((center[1] + earring_point[1]) / 2)
@@ -138,7 +147,8 @@ def catalog_sprite_layout(sprite: np.ndarray) -> dict:
     height, width = sprite.shape[:2]
     aspect = height / max(1, width)
     hang = aspect >= 1.45
-    return {"aspect": float(aspect), "hang": hang, "width_ratio": 1.0 if hang else 0.62}
+    # Keep catalog sprites smaller than the AR earring so any debug paint stays natural.
+    return {"aspect": float(aspect), "hang": hang, "width_ratio": 0.55 if hang else 0.42}
 
 
 def save_catalog_sprite(image: np.ndarray, path: Path) -> bool:
@@ -175,9 +185,10 @@ def composite_catalog_earring(
 
 
 def catalog_target_width(ear_width: float | None, frame_width: int, width_ratio: float) -> int:
-    scaled = (ear_width or 0.08) * frame_width * width_ratio
-    capped = min(scaled, frame_width * 0.18)
-    return max(22, int(capped))
+    # Cap against ear scale so catalog cutouts never dominate the face.
+    scaled = (ear_width or 0.04) * frame_width * max(0.25, min(float(width_ratio), 0.7))
+    capped = min(scaled, frame_width * 0.08)
+    return max(14, int(capped))
 
 
 def _as_bgra(image: np.ndarray) -> np.ndarray | None:

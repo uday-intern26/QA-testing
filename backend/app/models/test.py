@@ -18,7 +18,7 @@ class TestDefinition(SQLModel, table=True):
     ear_side: str = "left"
     selected_finger: str | None = "ring"
     capture_fps: int = 5
-    capture_duration_seconds: float = 6.0
+    capture_duration_seconds: float = 1.0
     minimum_confidence: float = 0.80
     pass_threshold: float = 0.10
     fail_threshold: float = 0.15
@@ -26,5 +26,7 @@ class TestDefinition(SQLModel, table=True):
     maximum_consecutive_failures: int = 2
     zone_y_scale: float = 1.0
     min_selected_frames: int = 5
-    max_selected_frames: int = 30
+    max_selected_frames: int = 10
+    debug_mode: bool = False
+    debug_options_json: str | None = None
     created_at: datetime = Field(default_factory=utcnow)

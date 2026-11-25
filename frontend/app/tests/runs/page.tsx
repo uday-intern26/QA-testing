@@ -13,7 +13,8 @@ export default function RunsPage() {
   const [busy, setBusy] = useState(false);
 
   const refresh = useCallback(() => {
-    return api.runs()
+    return api
+      .runs()
       .then((items) => setRuns(items as RunRow[]))
       .catch((exc: Error) => setError(exc.message));
   }, []);
@@ -65,6 +66,7 @@ export default function RunsPage() {
           Clear all history
         </button>
       </div>
+      <p className="text-sm text-zinc-400">Click a test name to open its results.</p>
       {error ? <p className="text-sm text-red-400">{error}</p> : null}
       <table className="w-full text-left text-sm">
         <thead className="text-xs uppercase text-zinc-500">
@@ -77,30 +79,39 @@ export default function RunsPage() {
           </tr>
         </thead>
         <tbody>
-          {runs.map((run) => (
-            <tr key={String(run.test_run_id)} className="border-t border-zinc-800">
-              <td className="py-2 font-mono text-xs">{run.test_run_id}</td>
-              <td>
-                <Link className="underline" href={`/tests/${run.test_id}`}>
-                  {run.test_name}
-                </Link>
-              </td>
-              <td>{run.status}</td>
-              <td>
-                <StatusBadge status={String(run.overall_status || "NOT_RUN")} />
-              </td>
-              <td className="py-2 text-right">
-                <button
-                  type="button"
-                  disabled={busy}
-                  onClick={() => void removeRun(String(run.test_run_id))}
-                  className="rounded border border-red-900 px-2 py-1 text-xs text-red-300 hover:bg-red-950 disabled:opacity-40"
-                >
-                  Delete
-                </button>
-              </td>
-            </tr>
-          ))}
+          {runs.map((run) => {
+            const testId = String(run.test_id);
+            return (
+              <tr key={String(run.test_run_id)} className="border-t border-zinc-800">
+                <td className="py-2 font-mono text-xs text-zinc-400">{run.test_run_id}</td>
+                <td>
+                  <Link
+                    href={`/tests/${encodeURIComponent(testId)}`}
+                    className="font-medium text-zinc-100 underline decoration-zinc-600 hover:decoration-zinc-200"
+                    title="Open results"
+                  >
+                    {run.test_name}
+                  </Link>
+                </td>
+                <td>{run.status}</td>
+                <td>
+                  <Link href={`/tests/${encodeURIComponent(testId)}`}>
+                    <StatusBadge status={String(run.overall_status || "NOT_RUN")} />
+                  </Link>
+                </td>
+                <td className="py-2 text-right">
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => void removeRun(String(run.test_run_id))}
+                    className="rounded border border-red-900 px-2 py-1 text-xs text-red-300 hover:bg-red-950 disabled:opacity-40"
+                  >
+                    Delete
+                  </button>
+                </td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
       {!runs.length ? <p className="text-sm text-zinc-500">No test runs yet.</p> : null}

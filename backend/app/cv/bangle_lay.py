@@ -95,6 +95,7 @@ def evaluate_bangle_lay(
     side: str = "left",
     jewelry_id: str | None = None,
     debug_state: dict | None = None,
+    hand_landmarks=None,
 ) -> dict:
     """
     Measure bangle lay around the wrist.
@@ -115,6 +116,7 @@ def evaluate_bangle_lay(
         debug_state=debug_state,
         side=wrist_side,
         style="bangle",
+        hand_landmarks=hand_landmarks,
     )
     checks: dict[str, dict] = {}
 

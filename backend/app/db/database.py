@@ -54,6 +54,8 @@ def _ensure_sqlite_columns(engine) -> None:
         return
     statements = (
         ("tests", "selected_finger", "ALTER TABLE tests ADD COLUMN selected_finger VARCHAR DEFAULT 'ring'"),
+        ("tests", "debug_mode", "ALTER TABLE tests ADD COLUMN debug_mode BOOLEAN DEFAULT 0"),
+        ("tests", "debug_options_json", "ALTER TABLE tests ADD COLUMN debug_options_json VARCHAR"),
     )
     with engine.begin() as connection:
         for table, column, ddl in statements:

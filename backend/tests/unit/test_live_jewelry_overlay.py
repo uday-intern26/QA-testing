@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 
+from app.cv.necklace_lay import NECKLACE_TRACING, necklace_overlay_width_ratio
 from app.cv.types import EarlobeAnchor, FaceLandmarkResult, Landmark
 from app.services.live_jewelry_overlay import earlobe_placements, necklace_placements, paint_preview, sprite_data_url
 
@@ -67,5 +68,17 @@ def test_necklace_overlay_uses_neck_not_ears():
     placements = necklace_placements(face)
     assert len(placements) == 1
     assert placements[0]["side"] == "center"
-    assert placements[0]["y"] > 0.7
-    assert placements[0]["y"] < 0.95
+    # Chin y=0.70, face width=0.30. Neck sits 8.1 cm below the chin (7.5 cm offset + 0.6 cm down nudge).
+    assert abs(placements[0]["y"] - (0.7 + 8.1 * 0.30 / 14.0)) < 1e-6
+    assert abs(placements[0]["x"] - (0.5 - 1.4 * 0.30 / 14.0)) < 1e-6
+
+
+def test_necklace_tracing_values_match_product():
+    assert NECKLACE_TRACING["chinToNeckOffsetCm"] == (0.0, -7.5, -4.5)
+    assert NECKLACE_TRACING["shoulderToNeckOffsetCm"] == (0.0, 3.5, 0.0)
+    assert NECKLACE_TRACING["widthToFaceWidth"] == 1.05
+    assert NECKLACE_TRACING["widthToShoulderWidth"] == 0.42
+    assert NECKLACE_TRACING["tipSpanToNeckWidth"] == 1.06
+    assert NECKLACE_TRACING["displayScale"] == 1.12
+    assert NECKLACE_TRACING["liveNudge"] == {"rightCm": -1.4, "upCm": -0.6, "stretch": 0.895}
+    assert abs(necklace_overlay_width_ratio() * 0.55 - 1.12) < 1e-9
