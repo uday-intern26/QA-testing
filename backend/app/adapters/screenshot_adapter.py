@@ -14,3 +14,12 @@ class ScreenshotAdapter:
     async def capture(self, path: Path) -> Path:
         await self.browser.screenshot(path)
         return path
+
+    async def capture_playing(self, path: Path) -> Path:
+        """Capture while the try-on video keeps advancing."""
+        playing = getattr(self.browser, "screenshot_playing", None)
+        if playing is not None:
+            await playing(path)
+        else:
+            await self.browser.screenshot(path)
+        return path

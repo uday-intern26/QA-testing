@@ -71,13 +71,15 @@ class ApplicationService:
             raise ValueError("Upload an mp4, webm, or mov of a person wearing no earrings.")
         if not content:
             raise ValueError("The face video file is empty.")
-        captures_dir.mkdir(parents=True, exist_ok=True)
-        for existing in captures_dir.iterdir():
+        # One face video per application — never reuse another app's upload as the camera.
+        folder = captures_dir / "face" / application.id
+        folder.mkdir(parents=True, exist_ok=True)
+        for existing in folder.iterdir():
             if existing.is_file() and existing.suffix.lower() in {".mp4", ".webm", ".mov", ".y4m", ".avi"}:
                 existing.unlink()
-        destination = captures_dir / "bare-face.mp4"
+        destination = folder / f"face{suffix}"
         destination.write_bytes(content)
-        application.video_path = str(destination)
+        application.video_path = str(destination.resolve())
         application.updated_at = datetime.now(timezone.utc)
         session.add(application)
         session.commit()

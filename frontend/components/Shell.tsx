@@ -12,18 +12,7 @@ const GROUPS = [
       { href: "/applications", label: "Applications" },
       { href: "/tests", label: "Test Configurations" },
       { href: "/tests/runs", label: "Test Runs" },
-      { href: "/results", label: "Latest Results" },
-      { href: "/reports", label: "Reports" },
       { href: "/settings", label: "Settings", icon: "gear" as const },
-    ],
-  },
-  {
-    title: "Agentic QA",
-    links: [
-      { href: "/agentic", label: "Bench" },
-      { href: "/agentic/contracts", label: "Contracts" },
-      { href: "/agentic/scenarios", label: "Scenarios" },
-      { href: "/agentic/runs", label: "Runs" },
     ],
   },
 ];
@@ -58,7 +47,6 @@ function isActive(pathname: string, href: string) {
 
 export function Shell({ children }: { children: ReactNode }) {
   const pathname = usePathname();
-  const inAgentic = pathname.startsWith("/agentic");
 
   return (
     <div className="flex min-h-screen">
@@ -67,7 +55,7 @@ export function Shell({ children }: { children: ReactNode }) {
           <p className="text-xs uppercase tracking-[0.2em] text-[var(--muted)]">AIJewel QA</p>
           <h1 className="mt-1 text-lg font-semibold text-[var(--text)]">Unified Console</h1>
           <p className="mt-1 text-xs text-[var(--muted)]">
-            {inAgentic ? "Agentic API testing" : "Virtual try-on testing"}
+            All jewelry try-on testing
           </p>
         </div>
         <nav className="mt-8 space-y-6">

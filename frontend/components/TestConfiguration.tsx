@@ -2,6 +2,7 @@
 
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { api, ApplicationRecord, TestRecord } from "@/lib/api";
+import { DebugModePanel, DebugOptions } from "./DebugModePanel";
 import { Card, Field, inputClass } from "./Shell";
 
 type JewelryType = "earring" | "necklace" | "bracelet" | "ring" | "bangle";
@@ -23,65 +24,65 @@ const TYPE_PROFILES: Record<JewelryType, TypeProfile> = {
   earring: {
     value: "earring",
     label: "Earring",
-    name: "Try-on URL earring on earlobe",
+    name: "Try-on URL earring placement",
     jewelryId: "Gold Diamond Bezel Stud Earring",
     sideMode: "ear",
     sideLabel: "Ear visible in the video",
     attachment: "Earlobe placement zone",
     bodyPoint: "earlobe",
-    jewelLabel: "earring",
+    jewelLabel: "jewelry",
   },
   necklace: {
     value: "necklace",
     label: "Necklace",
-    name: "Try-on URL necklace on neck",
+    name: "Try-on URL necklace placement",
     jewelryId: "Gold Pendant Necklace",
     sideMode: "center",
     sideLabel: "Attachment check",
     attachment: "Neck / chest placement",
     bodyPoint: "neck",
-    jewelLabel: "necklace",
+    jewelLabel: "jewelry",
   },
   bracelet: {
     value: "bracelet",
     label: "Bracelet",
-    name: "Try-on URL bracelet on wrist",
+    name: "Try-on URL bracelet placement",
     jewelryId: "Gold Chain Bracelet",
     sideMode: "side",
     sideLabel: "Wrist visible in the video",
     attachment: "Wrist placement",
     bodyPoint: "wrist",
-    jewelLabel: "bracelet",
+    jewelLabel: "jewelry",
   },
   ring: {
     value: "ring",
     label: "Ring",
-    name: "Try-on URL ring on finger",
+    name: "Try-on URL ring placement",
     jewelryId: "Gold Diamond Ring",
     sideMode: "side",
     sideLabel: "Hand / side visible in the video",
     attachment: "Finger placement",
     bodyPoint: "hand",
-    jewelLabel: "ring",
+    jewelLabel: "jewelry",
   },
   bangle: {
     value: "bangle",
     label: "Bangle",
-    name: "Try-on URL bangle on wrist",
+    name: "Try-on URL bangle placement",
     jewelryId: "Gold Bangle",
     sideMode: "side",
     sideLabel: "Wrist visible in the video",
     attachment: "Wrist placement",
     bodyPoint: "wrist",
-    jewelLabel: "bangle",
+    jewelLabel: "jewelry",
   },
 };
 
 const TYPE_ORDER: JewelryType[] = ["earring", "necklace", "bracelet", "ring", "bangle"];
 
 const SHARED_DEFAULTS = {
-  capture_fps: 5,
-  capture_duration_seconds: 6,
+  capture_fps: 10,
+  capture_duration_seconds: 1,
   minimum_confidence: 0.5,
   pass_threshold: 0.1,
   fail_threshold: 0.15,
@@ -93,25 +94,25 @@ const SHARED_DEFAULTS = {
 const TYPE_NUMERIC_DEFAULTS: Record<JewelryType, typeof SHARED_DEFAULTS> = {
   earring: {
     capture_fps: 10,
-    capture_duration_seconds: 6,
+    capture_duration_seconds: 1,
     minimum_confidence: 0.8,
-    pass_threshold: 0.08,
-    fail_threshold: 0.15,
+    pass_threshold: 0.02,
+    fail_threshold: 0.05,
     minimum_pass_rate: 0.95,
     maximum_consecutive_failures: 2,
   },
   necklace: {
     capture_fps: 10,
-    capture_duration_seconds: 6,
+    capture_duration_seconds: 1,
     minimum_confidence: 0.8,
-    pass_threshold: 0.1,
-    fail_threshold: 0.15,
+    pass_threshold: 0.02,
+    fail_threshold: 0.05,
     minimum_pass_rate: 0.95,
     maximum_consecutive_failures: 2,
   },
   bracelet: {
     capture_fps: 10,
-    capture_duration_seconds: 6,
+    capture_duration_seconds: 1,
     minimum_confidence: 0.8,
     pass_threshold: 0.1,
     fail_threshold: 0.18,
@@ -120,7 +121,7 @@ const TYPE_NUMERIC_DEFAULTS: Record<JewelryType, typeof SHARED_DEFAULTS> = {
   },
   ring: {
     capture_fps: 10,
-    capture_duration_seconds: 6,
+    capture_duration_seconds: 1,
     minimum_confidence: 0.8,
     pass_threshold: 0.08,
     fail_threshold: 0.15,
@@ -129,7 +130,7 @@ const TYPE_NUMERIC_DEFAULTS: Record<JewelryType, typeof SHARED_DEFAULTS> = {
   },
   bangle: {
     capture_fps: 10,
-    capture_duration_seconds: 6,
+    capture_duration_seconds: 1,
     minimum_confidence: 0.8,
     pass_threshold: 0.08,
     fail_threshold: 0.15,
@@ -154,16 +155,6 @@ function defaultsFor(type: JewelryType) {
 
 const EMPTY = defaultsFor("earring");
 
-function sideSummary(test: TestRecord) {
-  const profile = TYPE_PROFILES[test.jewelry_type as JewelryType];
-  if (test.jewelry_type === "ring") {
-    return `finger ${test.selected_finger || "ring"} · side ${test.ear_side}`;
-  }
-  if (!profile || profile.sideMode === "center") return profile?.attachment || "center";
-  if (profile.sideMode === "ear") return `ear ${test.ear_side}`;
-  return `side ${test.ear_side}`;
-}
-
 export function TestConfiguration({
   applicationId,
   onCreated,
@@ -172,10 +163,13 @@ export function TestConfiguration({
   onCreated?: (test: TestRecord) => void;
 }) {
   const [applications, setApplications] = useState<ApplicationRecord[]>([]);
-  const [tests, setTests] = useState<TestRecord[]>([]);
   const [form, setForm] = useState(EMPTY);
   const [appId, setAppId] = useState(applicationId || "");
   const [error, setError] = useState("");
+  const [savedNote, setSavedNote] = useState("");
+  const [debugMode, setDebugMode] = useState(false);
+  // Debug overrides are per jewellery category, so they reset when the type changes.
+  const [debugOptions, setDebugOptions] = useState<DebugOptions>({});
 
   const profile = useMemo(
     () => TYPE_PROFILES[(form.jewelry_type as JewelryType) || "earring"] || TYPE_PROFILES.earring,
@@ -184,11 +178,10 @@ export function TestConfiguration({
 
   useEffect(() => {
     let cancelled = false;
-    Promise.all([api.applications(), api.tests()])
-      .then(([apps, existing]) => {
-        if (cancelled) return;
-        setApplications(apps);
-        setTests(existing);
+    api
+      .applications()
+      .then((apps) => {
+        if (!cancelled) setApplications(apps);
       })
       .catch((exc: Error) => {
         if (!cancelled) setError(exc.message);
@@ -209,6 +202,7 @@ export function TestConfiguration({
     const previous = TYPE_PROFILES[form.jewelry_type as JewelryType];
     const previousNumeric = TYPE_NUMERIC_DEFAULTS[(form.jewelry_type as JewelryType) || "earring"];
     const nextNumeric = TYPE_NUMERIC_DEFAULTS[nextType];
+    setDebugOptions({});
     setForm((current) => {
       const nameStillDefault = !previous || current.name === previous.name || current.name.trim() === "";
       const jewelryStillDefault =
@@ -239,6 +233,7 @@ export function TestConfiguration({
   async function onSubmit(event: FormEvent) {
     event.preventDefault();
     setError("");
+    setSavedNote("");
     try {
       const earSide =
         profile.sideMode === "center"
@@ -260,8 +255,11 @@ export function TestConfiguration({
         fail_threshold: Number(form.fail_threshold),
         minimum_pass_rate: Number(form.minimum_pass_rate),
         maximum_consecutive_failures: Number(form.maximum_consecutive_failures),
+        debug_mode: debugMode,
+        debug_options: Object.keys(debugOptions).length ? debugOptions : null,
       });
-      setTests(await api.tests());
+      // Do not keep a visible test-configuration history list on this page.
+      setSavedNote(`Ready to run: ${created.id} · ${created.name}`);
       onCreated?.(created);
     } catch (exc) {
       setError(exc instanceof Error ? exc.message : "Unable to create the test");
@@ -339,7 +337,7 @@ export function TestConfiguration({
         ) : null}
         <Field label="Capture FPS">
           <select className={inputClass} value={form.capture_fps} onChange={(event) => update("capture_fps", event.target.value)}>
-            {[1, 2, 5, 10].map((fps) => (
+            {[1, 2, 5, 10, 15, 30].map((fps) => (
               <option key={fps} value={fps}>
                 {fps}
               </option>
@@ -398,47 +396,25 @@ export function TestConfiguration({
             onChange={(event) => update("maximum_consecutive_failures", event.target.value)}
           />
         </Field>
+        <DebugModePanel
+          jewelryType={form.jewelry_type}
+          enabled={debugMode}
+          options={debugOptions}
+          onToggle={setDebugMode}
+          onChange={setDebugOptions}
+        />
         <div className="md:col-span-2 rounded border border-zinc-800 bg-zinc-950/40 px-3 py-2 text-sm text-zinc-400">
           Placement rule for <span className="text-zinc-200">{profile.label}</span>: the {profile.jewelLabel}{" "}
           attachment point must sit on the {profile.bodyPoint} ({profile.attachment.toLowerCase()}).
         </div>
         <div className="md:col-span-2">
           <button className="rounded bg-zinc-100 px-4 py-2 text-sm font-medium text-zinc-950" type="submit">
-            Save Test Configuration
+            Apply Test Configuration
           </button>
+          {savedNote ? <p className="mt-2 text-sm text-emerald-400">{savedNote}</p> : null}
           {error ? <p className="mt-2 text-sm text-red-400">{error}</p> : null}
         </div>
       </form>
-      <ul className="mt-4 space-y-2 text-sm text-zinc-400">
-        {tests.map((test) => (
-          <li key={test.id} className="flex items-center justify-between gap-3">
-            <button type="button" className="text-left underline" onClick={() => onCreated?.(test)}>
-              <span className="text-zinc-200">
-                {test.id} · {test.name}
-              </span>
-              <span className="mt-0.5 block text-xs text-zinc-500">
-                {test.jewelry_type}
-                {test.jewelry_id ? ` · ${test.jewelry_id}` : ""} · {sideSummary(test)}
-              </span>
-            </button>
-            <button
-              type="button"
-              className="rounded border border-red-900 px-2 py-1 text-xs text-red-300 hover:bg-red-950"
-              onClick={async () => {
-                if (!window.confirm(`Delete test ${test.name} and all of its runs?`)) return;
-                try {
-                  await api.deleteTest(test.id);
-                  setTests(await api.tests());
-                } catch (exc) {
-                  setError(exc instanceof Error ? exc.message : "Delete failed");
-                }
-              }}
-            >
-              Delete
-            </button>
-          </li>
-        ))}
-      </ul>
     </Card>
   );
 }

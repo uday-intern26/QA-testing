@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from app.cv.types import EarlobeAnchor, EarringAnchor, FaceLandmarkResult, Landmark, PlacementMeasurement
@@ -14,6 +15,21 @@ NOSE = 1
 # Approximate outer face points used as shoulder-direction proxies.
 LEFT_FACE = 127
 RIGHT_FACE = 356
+
+# Product necklace trace. Centimetre offsets are y-up. Image y grows downward.
+# Cheek-to-cheek face width is treated as 14 cm so those offsets land in normalized image space.
+NECKLACE_TRACING: dict = {
+    "chinToNeckOffsetCm": (0.0, -7.5, -4.5),
+    "shoulderToNeckOffsetCm": (0.0, 3.5, 0.0),
+    "widthToFaceWidth": 1.05,
+    "widthToShoulderWidth": 0.42,
+    "tipSpanToNeckWidth": 1.06,
+    "displayScale": 1.12,
+    "liveNudge": {"rightCm": -1.4, "upCm": -0.6, "stretch": 0.895},
+}
+REFERENCE_FACE_WIDTH_CM = 14.0
+# The shared live-overlay script multiplies width by 0.55 for every jewelry type.
+_OVERLAY_SCRIPT_WIDTH_FACTOR = 0.55
 
 
 @dataclass
@@ -29,6 +45,51 @@ class NeckGeometry:
     pendant_y: float
     face_top_y: float
     confidence: float
+    shoulder_line_y: float = 0.0
+
+
+def necklace_overlay_width_ratio() -> float:
+    """Live sprite scale. displayScale is the on-screen scale after the shared 0.55 factor."""
+    return float(NECKLACE_TRACING["displayScale"]) / _OVERLAY_SCRIPT_WIDTH_FACTOR
+
+
+def necklace_tip_span(neck_width: float) -> float:
+    return float(neck_width) * float(NECKLACE_TRACING["tipSpanToNeckWidth"])
+
+
+def _span_and_shoulder(neck_width: float) -> tuple[float, float]:
+    span = necklace_tip_span(neck_width)
+    shoulder = span / float(NECKLACE_TRACING["widthToShoulderWidth"])
+    return span, max(0.06, shoulder)
+
+
+def trace_necklace_neckline(
+    chin_x: float,
+    chin_y: float,
+    face_width: float,
+    yaw_deg: float = 0.0,
+) -> tuple[float, float, float, float, float]:
+    """Neck point, neck width, shoulder width, and shoulder line from the necklace trace.
+
+    Returns center_x, neckline_y, neck_width, shoulder_width, shoulder_line_y.
+    """
+    nudge = NECKLACE_TRACING["liveNudge"]
+    chin_offset = NECKLACE_TRACING["chinToNeckOffsetCm"]
+    shoulder_offset = NECKLACE_TRACING["shoulderToNeckOffsetCm"]
+    cm = face_width / REFERENCE_FACE_WIDTH_CM
+    # Depth offset shifts sideways only as the head yaws. Frontal yaw leaves x unchanged.
+    right_cm = float(chin_offset[0]) + float(nudge["rightCm"]) + float(chin_offset[2]) * math.sin(math.radians(yaw_deg))
+    down_cm = -float(chin_offset[1]) - float(nudge["upCm"])
+    center_x = min(0.98, max(0.02, chin_x + right_cm * cm))
+    neckline_y = max(chin_y + 0.02, min(0.90, chin_y + down_cm * cm))
+    span = face_width * float(NECKLACE_TRACING["widthToFaceWidth"]) * float(nudge["stretch"])
+    neck_width = max(0.04, span / float(NECKLACE_TRACING["tipSpanToNeckWidth"]))
+    shoulder_width = max(0.06, span / float(NECKLACE_TRACING["widthToShoulderWidth"]))
+    # shoulderToNeckOffsetCm is y-up, so a positive y puts the shoulder line below the neck.
+    nudge_down = -float(nudge["upCm"]) * cm
+    anatomical_neck_y = neckline_y - nudge_down
+    shoulder_line_y = min(0.98, anatomical_neck_y + float(shoulder_offset[1]) * cm)
+    return center_x, neckline_y, neck_width, shoulder_width, shoulder_line_y
 
 
 def _point(landmarks: list[Landmark], index: int) -> Landmark | None:
@@ -43,18 +104,25 @@ def neck_geometry(face: FaceLandmarkResult | None, neck: EarlobeAnchor | None) -
         if neck is None:
             return None
         width = max(0.04, float(neck.ear_width))
+        _span, shoulder_width = _span_and_shoulder(width)
+        half = shoulder_width * 0.5
+        face_width = _span / (
+            float(NECKLACE_TRACING["widthToFaceWidth"]) * float(NECKLACE_TRACING["liveNudge"]["stretch"])
+        )
+        shoulder_drop = float(NECKLACE_TRACING["shoulderToNeckOffsetCm"][1]) * (face_width / REFERENCE_FACE_WIDTH_CM)
         return NeckGeometry(
             center_x=float(neck.x),
             center_y=float(neck.y),
             neckline_y=float(neck.y),
             neck_width=width,
-            shoulder_width=width * 1.8,
-            left_shoulder_x=float(max(0.02, neck.x - width * 1.1)),
-            right_shoulder_x=float(min(0.98, neck.x + width * 1.1)),
+            shoulder_width=shoulder_width,
+            left_shoulder_x=float(max(0.02, neck.x - half)),
+            right_shoulder_x=float(min(0.98, neck.x + half)),
             pendant_x=float(neck.x),
             pendant_y=float(min(0.98, neck.y + width * 0.55)),
             face_top_y=float(max(0.02, neck.y - width * 1.4)),
             confidence=float(neck.confidence),
+            shoulder_line_y=float(min(0.98, neck.y + shoulder_drop)),
         )
 
     chin = _point(face.landmarks, CHIN)
@@ -69,20 +137,20 @@ def neck_geometry(face: FaceLandmarkResult | None, neck: EarlobeAnchor | None) -
     face_width = 0.08
     if left is not None and right is not None:
         face_width = max(0.04, abs(right.x - left.x))
-    neck_width = face_width * 0.55
-    shoulder_width = face_width * 1.35
     center_x = float(chin.x)
     if left is not None and right is not None:
         center_x = float((left.x + right.x) / 2.0)
-    neckline_y = float(chin.y + face_width * 0.22)
-    if neckline_y > 0.92:
-        neckline_y = float(min(0.92, chin.y + face_width * 0.12))
+    yaw = float(face.head_pose.yaw) if face.head_pose is not None else 0.0
+    center_x, neckline_y, neck_width, shoulder_width, shoulder_line_y = trace_necklace_neckline(
+        center_x, float(chin.y), face_width, yaw
+    )
     if neck is not None:
         center_x = float(neck.x)
         neckline_y = float(neck.y)
         neck_width = max(neck_width, float(neck.ear_width))
-    left_shoulder = float(max(0.02, center_x - shoulder_width * 0.55))
-    right_shoulder = float(min(0.98, center_x + shoulder_width * 0.55))
+        _span, shoulder_width = _span_and_shoulder(neck_width)
+    left_shoulder = float(max(0.02, center_x - shoulder_width * 0.5))
+    right_shoulder = float(min(0.98, center_x + shoulder_width * 0.5))
     if left_face is not None and right_face is not None:
         left_shoulder = float(min(left_shoulder, left_face.x - face_width * 0.15))
         right_shoulder = float(max(right_shoulder, right_face.x + face_width * 0.15))
@@ -105,6 +173,7 @@ def neck_geometry(face: FaceLandmarkResult | None, neck: EarlobeAnchor | None) -
         pendant_y=pendant_y,
         face_top_y=float(max(0.01, face_top)),
         confidence=confidence,
+        shoulder_line_y=shoulder_line_y,
     )
 
 
@@ -124,13 +193,9 @@ def _accuracy_from_error(error: float, fail_threshold: float) -> float:
 
 
 def _combine(*statuses: str) -> str:
-    if any(status == "FAIL" for status in statuses):
-        return "FAIL"
-    if any(status == "WARNING" for status in statuses):
-        return "WARNING"
-    if all(status == "PASS" for status in statuses):
-        return "PASS"
-    return "FAIL"
+    from app.cv.tryon_placement_rules import combine_component_statuses
+
+    return combine_component_statuses(statuses)
 
 
 def evaluate_necklace_lay(
@@ -149,19 +214,20 @@ def evaluate_necklace_lay(
     agreement with the expected neckline model, not detection confidence.
     """
     minimum_confidence = float(config.get("minimum_confidence", 0.80))
-    pass_threshold = float(config.get("pass_threshold", 0.10))
-    fail_threshold = float(config.get("fail_threshold", 0.15))
+    # Spec section 4 defaults: PASS <= 0.02, WARNING <= 0.05, FAIL > 0.05
+    pass_threshold = float(config.get("pass_threshold", 0.02))
+    fail_threshold = float(config.get("fail_threshold", 0.05))
     zone_y_scale = float(config.get("zone_y_scale", 1.0))
 
     geometry = neck_geometry(face, neck)
     checks: dict[str, dict] = {}
 
-    # 1. Neck detection
+    # 1. Neck detection — occluded / missing is NOT TESTABLE.
     if geometry is None or neck is None:
         checks["neck_detection"] = {
-            "status": "FAIL",
+            "status": "NOT_TESTABLE",
             "accuracy": 0.0,
-            "detail": "Neck was not detected from facial / body landmarks.",
+            "detail": "Neck / shoulder anchors are not visible / not testable.",
         }
     elif geometry.confidence < minimum_confidence:
         checks["neck_detection"] = {
@@ -179,11 +245,29 @@ def evaluate_necklace_lay(
         }
 
     jewelry_ok = bool(jewelry and jewelry.visible and jewelry.x is not None and jewelry.y is not None)
+    if geometry is None or neck is None:
+        not_testable = {
+            "status": "NOT_TESTABLE",
+            "accuracy": 0.0,
+            "detail": "Neck / shoulder anchors are not visible / not testable.",
+        }
+        for key in (
+            "necklace_placement",
+            "neckline_alignment",
+            "center_alignment",
+            "left_right_alignment",
+            "pendant_position",
+            "shoulder_clearance",
+            "necklace_to_neck_distance",
+        ):
+            checks[key] = dict(not_testable)
+        return _finalize(checks, geometry, jewelry if jewelry_ok else None, pass_threshold, fail_threshold)
+
     if not jewelry_ok:
         fail_rest = {
             "status": "FAIL",
             "accuracy": 0.0,
-            "detail": "Necklace attachment point was not detected.",
+            "detail": "Necklace is detached from its anchors.",
         }
         for key in (
             "necklace_placement",
@@ -199,27 +283,11 @@ def evaluate_necklace_lay(
 
     assert jewelry is not None and jewelry.x is not None and jewelry.y is not None
     jx, jy = float(jewelry.x), float(jewelry.y)
-    if geometry is None:
-        for key in (
-            "necklace_placement",
-            "neckline_alignment",
-            "center_alignment",
-            "left_right_alignment",
-            "pendant_position",
-            "shoulder_clearance",
-            "necklace_to_neck_distance",
-        ):
-            checks[key] = {
-                "status": "FAIL",
-                "accuracy": 0.0,
-                "detail": "Cannot score necklace lay without a neck estimate.",
-            }
-        return _finalize(checks, geometry, jewelry, pass_threshold, fail_threshold)
 
-    # Normalize with shoulder/neck width so thresholds stay comparable to earring config values.
+    # Landmark-relative Euclidean error vs neckline center (spec section 4).
+    from app.cv.tryon_placement_rules import classify_euclidean, euclidean_error
+
     norm_width = max(geometry.neck_width, geometry.shoulder_width * 0.45)
-
-    # Allowed necklace band: around the neckline, hanging toward upper chest (not face / not mid-chest).
     band_x_min = geometry.center_x - 0.65 * norm_width
     band_x_max = geometry.center_x + 0.65 * norm_width
     band_y_min = geometry.neckline_y - 0.25 * norm_width
@@ -228,17 +296,18 @@ def evaluate_necklace_lay(
     clamped_y = min(max(jy, band_y_min), band_y_max)
     band_dx, band_dy = jx - clamped_x, jy - clamped_y
     band_raw = distance(band_dx, band_dy)
-    necklace_to_neck = band_raw / norm_width if norm_width > 1e-8 else float("inf")
+    # Outside-band distance kept for zone messaging; primary score is Euclidean to neckline.
+    necklace_to_neck = euclidean_error(geometry.center_x, geometry.neckline_y, jx, jy)
 
     # Face / shoulder / chest zones for hard FAIL placement rules
     on_face = jy < geometry.face_top_y + geometry.neck_width * 0.55 and abs(jx - geometry.center_x) < geometry.neck_width * 1.2
     floating_above = jy < geometry.neckline_y - 0.45 * norm_width
     on_chest_too_low = jy > geometry.pendant_y + 0.9 * norm_width
     left_shoulder_hit = (
-        abs(jx - geometry.left_shoulder_x) <= 0.4 * norm_width and abs(jy - geometry.neckline_y) <= 0.55 * norm_width
+        abs(jx - geometry.left_shoulder_x) <= 0.4 * norm_width and abs(jy - geometry.shoulder_line_y) <= 0.55 * norm_width
     )
     right_shoulder_hit = (
-        abs(jx - geometry.right_shoulder_x) <= 0.4 * norm_width and abs(jy - geometry.neckline_y) <= 0.55 * norm_width
+        abs(jx - geometry.right_shoulder_x) <= 0.4 * norm_width and abs(jy - geometry.shoulder_line_y) <= 0.55 * norm_width
     )
     on_shoulder = left_shoulder_hit or right_shoulder_hit
 

@@ -67,7 +67,7 @@ export function ReferenceUpload({
   return (
     <Card title="Reference Images">
       <div className="mb-4 flex flex-wrap items-end gap-3">
-        <Field label="Ear side for analysis">
+        <Field label="Side for analysis">
           <select className={inputClass} value={side} onChange={(event) => setSide(event.target.value)}>
             <option value="left">Left</option>
             <option value="right">Right</option>

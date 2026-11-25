@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
-SEVERITY = {"PASS": 0, "WARNING": 1, "FAIL": 2, "NOT_RUN": 3}
+SEVERITY = {"PASS": 0, "WARNING": 1, "FAIL": 2, "NOT_TESTABLE": 3, "NOT_RUN": 4}
 
 
 @dataclass
@@ -16,6 +16,7 @@ class TemporalSummary:
     passed_frames: int
     warning_frames: int
     failed_frames: int
+    not_testable_frames: int
     pass_rate: float
     max_consecutive_failures: int
     critical_detection_failures: int
@@ -45,12 +46,28 @@ def summarize_temporal(
     passed = sum(1 for status in statuses if status == "PASS")
     warnings = sum(1 for status in statuses if status == "WARNING")
     failed = sum(1 for status in statuses if status == "FAIL")
+    not_testable = sum(1 for status in statuses if status == "NOT_TESTABLE")
     valid = passed + warnings + failed
-    rate = (passed / total) if total else 0.0
+    # Pass percentage excludes NOT_TESTABLE frames (section 7).
+    rate = (passed / valid) if valid else 0.0
     consecutive = max_consecutive_failures(statuses)
     reasons: list[str] = []
     if total == 0:
         reasons.append("No selected frames were available for temporal validation.")
+    if valid == 0 and total > 0:
+        return TemporalSummary(
+            status="NOT_TESTABLE",
+            total_frames=total,
+            valid_frames=0,
+            passed_frames=0,
+            warning_frames=0,
+            failed_frames=0,
+            not_testable_frames=not_testable,
+            pass_rate=0.0,
+            max_consecutive_failures=0,
+            critical_detection_failures=detection_failures,
+            reason="No testable frames were available (anchors occluded or not visible).",
+        )
     if rate < minimum_pass_rate:
         reasons.append(
             f"Pass rate {rate:.1%} is below the configured minimum {minimum_pass_rate:.1%}."
@@ -77,6 +94,7 @@ def summarize_temporal(
         passed_frames=passed,
         warning_frames=warnings,
         failed_frames=failed,
+        not_testable_frames=not_testable,
         pass_rate=rate,
         max_consecutive_failures=consecutive,
         critical_detection_failures=detection_failures,
@@ -87,10 +105,15 @@ def summarize_temporal(
 def combine_statuses(statuses: list[str]) -> str:
     if not statuses:
         return "NOT_RUN"
-    if any(status == "FAIL" for status in statuses):
+    testable = [status for status in statuses if status not in {"NOT_TESTABLE", "NOT_RUN", "WAITING", "SKIPPED"}]
+    if any(status == "FAIL" for status in testable):
         return "FAIL"
-    if any(status == "WARNING" for status in statuses):
+    if any(status == "WARNING" for status in testable):
         return "WARNING"
+    if testable and all(status == "PASS" for status in testable):
+        return "PASS"
     if all(status == "NOT_RUN" for status in statuses):
         return "NOT_RUN"
+    if statuses and all(status in {"NOT_TESTABLE", "NOT_RUN"} for status in statuses):
+        return "NOT_TESTABLE"
     return "PASS"

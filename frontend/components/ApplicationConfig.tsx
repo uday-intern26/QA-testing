@@ -8,17 +8,27 @@ import { StatusBadge } from "./StatusBadge";
 export function ApplicationConfig({
   selectedId,
   listVersion = 0,
+  username: usernameProp,
+  password: passwordProp,
   onSelect,
   onReady,
+  onUsernameChange,
+  onPasswordChange,
 }: {
   selectedId?: string;
   listVersion?: number;
+  username?: string;
+  password?: string;
   onSelect?: (application: ApplicationRecord) => void;
   onReady?: (application: ApplicationRecord, catalog: CatalogCategory[]) => void;
+  onUsernameChange?: (value: string) => void;
+  onPasswordChange?: (value: string) => void;
 }) {
   const [items, setItems] = useState<ApplicationRecord[]>([]);
   const [name, setName] = useState("");
   const [url, setUrl] = useState("");
+  const [localUsername, setLocalUsername] = useState("");
+  const [localPassword, setLocalPassword] = useState("");
   const [faceFile, setFaceFile] = useState<File | null>(null);
   const [savedVideo, setSavedVideo] = useState(false);
   const [validation, setValidation] = useState<ValidationResult | null>(null);
@@ -27,6 +37,10 @@ export function ApplicationConfig({
   const [statusNote, setStatusNote] = useState("");
   const openedKey = useRef("");
   const busyRef = useRef(false);
+  const username = usernameProp ?? localUsername;
+  const password = passwordProp ?? localPassword;
+  const setUsername = onUsernameChange ?? setLocalUsername;
+  const setPassword = onPasswordChange ?? setLocalPassword;
 
   async function refresh() {
     const next = await api.applications();
@@ -40,11 +54,13 @@ export function ApplicationConfig({
       .then((form) => {
         setName(form.name || "");
         setUrl(form.url || "");
+        // Do not auto-fill login — each try-on link needs the credentials entered in Step 1.
       })
       .catch(() => {
         setName("");
         setUrl("");
       });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -54,6 +70,11 @@ export function ApplicationConfig({
   function choose(item: ApplicationRecord) {
     setName(item.name);
     setUrl(item.url || "");
+    // Prefill saved username only as a hint; always clear password (never stored, per-link).
+    setUsername(item.username || "");
+    setPassword("");
+    // Camera uses only the file chosen in the Face video input for this open.
+    setFaceFile(null);
     setSavedVideo(Boolean(item.video_path));
     setValidation(null);
     setStatusNote("");
@@ -64,15 +85,21 @@ export function ApplicationConfig({
   async function openTryOn(force = false) {
     const trimmedName = name.trim() || "AIJewel Amplify";
     const trimmedUrl = url.trim();
+    const trimmedUser = username.trim();
+    const trimmedPass = password;
     if (!trimmedUrl) {
       setError("Enter the try-on link.");
       return;
     }
-    if (!faceFile && !savedVideo) {
-      setError("Upload a video of the girl wearing no earrings so the camera can turn on.");
+    if (!trimmedUser || !trimmedPass) {
+      setError("Enter the username and password for this try-on link. Each link has its own login.");
       return;
     }
-    const key = `${trimmedUrl}|${faceFile?.name || "saved"}`;
+    if (!faceFile) {
+      setError("Choose the face video to upload. Only that video is used as the try-on camera.");
+      return;
+    }
+    const key = `${trimmedUrl}|${trimmedUser}|${faceFile.name}|${faceFile.size}|${faceFile.lastModified}`;
     if (!force && (busyRef.current || openedKey.current === key)) {
       return;
     }
@@ -92,20 +119,28 @@ export function ApplicationConfig({
           name: trimmedName,
           type: "web",
           url: trimmedUrl,
+          username: trimmedUser || null,
+        });
+      } else if (trimmedUser && record.username !== trimmedUser) {
+        record = await api.updateApplication(record.id, {
+          url: trimmedUrl,
+          username: trimmedUser,
         });
       }
-      if (faceFile) {
-        record = await api.uploadFaceVideo(record.id, faceFile);
-        setSavedVideo(true);
-      }
-      const checked = { ...record, name: trimmedName, url: trimmedUrl };
+      // Always upload the file chosen in the form so the camera is exactly that video.
+      record = await api.uploadFaceVideo(record.id, faceFile);
+      setSavedVideo(true);
+      const checked = { ...record, name: trimmedName, url: trimmedUrl, username: trimmedUser || null };
       onSelect?.(checked);
       await refresh();
+      // Always login with the Step 1 fields for this link — never a hardcoded default.
       const result = await api.validateApplication({
         url: trimmedUrl,
         name: trimmedName,
         type: "web",
         application_id: record.id,
+        username: trimmedUser,
+        password: trimmedPass,
       });
       setValidation(result);
       if (result.status === "success") {
@@ -135,19 +170,6 @@ export function ApplicationConfig({
     }
   }
 
-  useEffect(() => {
-    const trimmedUrl = url.trim();
-    const ready = Boolean(trimmedUrl && (faceFile || savedVideo));
-    if (!ready || busyRef.current) return;
-    const key = `${trimmedUrl}|${faceFile?.name || "saved"}`;
-    if (openedKey.current === key) return;
-    const timer = window.setTimeout(() => {
-      void openTryOn(false);
-    }, 900);
-    return () => window.clearTimeout(timer);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [url, faceFile, savedVideo]);
-
   return (
     <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_280px]">
       <Card title="Try-on application">
@@ -170,14 +192,37 @@ export function ApplicationConfig({
                 openedKey.current = "";
                 setUrl(event.target.value);
               }}
-              onBlur={() => {
-                if (url.trim() && (faceFile || savedVideo)) {
-                  void openTryOn(false);
-                }
-              }}
             />
           </Field>
-          <Field label="Face video, no earrings">
+          <Field label="Username">
+            <input
+              className={inputClass}
+              type="text"
+              autoComplete="username"
+              placeholder="Login for this try-on link"
+              value={username}
+              onChange={(event) => {
+                openedKey.current = "";
+                setUsername(event.target.value);
+              }}
+              required
+            />
+          </Field>
+          <Field label="Password">
+            <input
+              className={inputClass}
+              type="password"
+              autoComplete="current-password"
+              placeholder="Password for this try-on link"
+              value={password}
+              onChange={(event) => {
+                openedKey.current = "";
+                setPassword(event.target.value);
+              }}
+              required
+            />
+          </Field>
+          <Field label="Face video (no jewelry worn)">
             <input
               className={inputClass}
               type="file"
@@ -189,9 +234,11 @@ export function ApplicationConfig({
               }}
             />
             <p className="mt-1 text-xs text-zinc-500">
-              {savedVideo
-                ? "A face video is already saved. When the try-on opens, this video is the camera."
-                : "This video becomes the try-on camera as soon as the page opens."}
+              {faceFile
+                ? `Camera will use only “${faceFile.name}”. Click Open try-on & camera to apply it.`
+                : savedVideo
+                  ? "Choose the face video file again. Only the video you upload is used as the camera."
+                  : "Upload a clear face/body video with no jewelry. Only that file becomes the try-on camera."}
             </p>
           </Field>
           <button
@@ -203,8 +250,8 @@ export function ApplicationConfig({
             {busy ? "Opening try-on & camera…" : "Open try-on & camera"}
           </button>
           <p className="text-xs text-zinc-500">
-            After you enter the try-on link and face video, the try-on page opens automatically with the
-            camera on.
+            Each try-on link has its own login. Enter the username and password for this link in Step 1 —
+            those values are used for Open try-on and for the test run. The password is never stored.
           </p>
           {statusNote ? <p className="text-sm text-sky-300">{statusNote}</p> : null}
           {error ? <p className="text-sm text-red-400">{error}</p> : null}

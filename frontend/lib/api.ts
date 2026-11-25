@@ -1,4 +1,4 @@
-export const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+export const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
 
 export type StatusName = "PASS" | "WARNING" | "FAIL" | "NOT_RUN" | "RUNNING" | "WAITING" | "SKIPPED" | string;
 
@@ -83,6 +83,8 @@ export interface TestRecord {
   zone_y_scale: number;
   min_selected_frames: number;
   max_selected_frames: number;
+  debug_mode?: boolean;
+  debug_options?: Record<string, number | boolean> | null;
 }
 
 export interface StepStatus {
@@ -128,8 +130,166 @@ export interface FrameRow {
   review_reason: string | null;
   image_url: string;
   annotated_image_url: string | null;
+  debug_image_url?: string | null;
   zone: { ear_width: number; ear_height: number } | null;
   earring_source?: string;
+  jewelry_category?: string | null;
+  detected_body_parts?: string[];
+  required_body_parts?: string[];
+  body_confidence?: number | null;
+  frame_quality_score?: number | null;
+  selection_status?: string | null;
+  rejection_reasons?: string[];
+  rejection_sources?: Record<string, string>;
+  jewelry_diagnostics?: JewelryDiagnostics | null;
+  landmark_validation?: LandmarkFrameValidation | null;
+  failure_reason?: string | null;
+  landmarks_url?: string | null;
+  matching_score?: number | null;
+  placement_accuracy?: number | null;
+  placement_rank?: number | null;
+  best_match?: boolean;
+  top_match?: boolean;
+  tracing_points_valid?: boolean;
+}
+
+export interface JewelryDiagnostics {
+  anchor_source?: string | null;
+  anchor_stage?: string | null;
+  qa_status?: string | null;
+  glb_loaded?: boolean | null;
+  mesh_visible?: boolean | null;
+  transform_computed?: boolean | null;
+  camera_found?: boolean | null;
+  anchor_projected?: boolean | null;
+  notes?: string[];
+}
+
+export interface FrameLandmarks {
+  frame_number: number;
+  jewelry_type: string;
+  uses_hand_landmarks: boolean;
+  face: number[][];
+  hand: number[][];
+  contours: Record<string, number[]>;
+  selected_landmarks: Record<string, number>;
+}
+
+export interface DebugTolerances {
+  position_tolerance_px: number | null;
+  position_tolerance_normalized: number;
+  rotation_tolerance_deg: number;
+  scale_min_ratio: number;
+  scale_max_ratio: number;
+  minimum_landmark_confidence: number;
+  minimum_valid_frame_percentage: number;
+  max_consecutive_tracking_failures: number;
+  minimum_stable_frames: number;
+  max_interframe_jump_normalized: number;
+}
+
+export interface DebugDisplayOptions {
+  show_face_mesh: boolean;
+  show_landmark_numbers: boolean;
+  highlight_selected_landmark: boolean;
+  show_expected_point: boolean;
+  show_actual_point: boolean;
+  show_deviation: boolean;
+  show_confidence: boolean;
+  show_frame_validation: boolean;
+  landmark_number_step: number;
+}
+
+export interface DebugProfile {
+  jewelry_type: string;
+  label: string;
+  body_region: string;
+  tolerances: DebugTolerances;
+  display: DebugDisplayOptions;
+}
+
+export interface LandmarkCheck {
+  status: string;
+  detail: string;
+  measured?: number | null;
+  tolerance?: number | null;
+}
+
+export interface LandmarkFrameValidation {
+  frame_number: number;
+  timestamp_ms: number;
+  side: string;
+  jewelry_type: string;
+  landmark_index: number | null;
+  expected: { x: number; y: number } | null;
+  actual: { x: number; y: number } | null;
+  expected_px: number[] | null;
+  actual_px: number[] | null;
+  position_error_px: number | null;
+  position_error_normalized: number | null;
+  position_error_body_relative?: number | null;
+  landmark_confidence: number | null;
+  jewelry_confidence: number | null;
+  rotation_deg: number | null;
+  scale_ratio: number | null;
+  checks: Record<string, LandmarkCheck>;
+  status: string;
+  failure_reason: string | null;
+  anchor_source?: string | null;
+  diagnostics?: JewelryDiagnostics | null;
+}
+
+export interface LandmarkSideSummary {
+  jewelry_type: string;
+  overall_status: string;
+  failure_reason: string | null;
+  checks: Record<string, LandmarkCheck>;
+  metrics: {
+    total_frames: number;
+    valid_frames: number;
+    testable_frames: number;
+    ignored_frames: number;
+    tracking_failures: number;
+    max_consecutive_failures: number;
+    position_jumps: number;
+    longest_stable_frames: number;
+    valid_frame_percentage: number;
+    average_position_error_px: number | null;
+    max_position_error_px: number | null;
+    average_position_error_normalized: number | null;
+    max_position_error_normalized: number | null;
+  };
+  anchor_sources?: Record<string, number>;
+  anchor_stages?: Record<string, number>;
+  tolerances: DebugTolerances;
+  frames: LandmarkFrameValidation[];
+}
+
+export interface LandmarkValidationReport {
+  enabled: boolean;
+  debug_mode: boolean;
+  enforced: boolean;
+  overall_status: string;
+  failure_reason: string | null;
+  profile: DebugProfile;
+  sides: Record<string, LandmarkSideSummary>;
+  debug_frames: { frame_number: number; side: string; status: string; failure_reason: string | null; path: string }[];
+  failed_debug_frames: { frame_number: number; side: string; status: string; failure_reason: string | null; path: string }[];
+}
+
+export interface ClosestFrame {
+  frame_number: number;
+  status: string;
+  review_label: string;
+  normalized_distance: number | null;
+  placement_gap: number | null;
+  pass_threshold: number;
+  fail_threshold?: number;
+  reason?: string | null;
+  body_confidence?: number | null;
+  earring_confidence?: number | null;
+  earlobe?: { x: number; y: number } | null;
+  earring_anchor?: { x: number; y: number } | null;
 }
 
 export interface QaReport {
@@ -147,8 +307,29 @@ export interface QaReport {
     frames_passed: number;
     frames_warning: number;
     frames_failed: number;
+    frames_not_testable?: number;
+    frames_rejected?: number;
+    frames_usable?: number;
+    minimum_required_frames?: number | null;
+    target_frames?: number | null;
+    near_pass_frames?: number;
+    best_placement_distance?: number | null;
+    frames_detected?: number;
+    frames_with_tracing_points?: number;
+    average_tracing_accuracy?: number | null;
+    best_frame_number?: number | null;
+    top_frame_numbers?: number[];
+    blank_dropped?: number;
+    testable_frames?: number;
     pass_rate: number;
+    pass_percentage?: number;
+    earring_accuracy?: number | null;
+    necklace_accuracy?: number | null;
     max_consecutive_failures: number;
+    jewelry_type?: string;
+    required_body_parts?: string[];
+    body_parts_detected_frames?: number;
+    jewelry_lay_seconds?: number | null;
   };
   thresholds: {
     pass_threshold: number;
@@ -157,6 +338,48 @@ export interface QaReport {
     minimum_confidence?: number;
     maximum_consecutive_failures: number;
     zone_y_scale?: number;
+    euclidean_pass?: number;
+    euclidean_fail?: number;
+  };
+  landmark_validation?: LandmarkValidationReport;
+  placement_validation?: {
+    jewelry_type?: string;
+    overall_status?: string;
+    components?: Record<
+      string,
+      {
+        status?: string;
+        x?: number | null;
+        y?: number | null;
+        placement_error?: number | null;
+        head_angle_deg?: number | null;
+        reason?: string | null;
+      }
+    >;
+    summary?: {
+      total_frames?: number;
+      passed_frames?: number;
+      warning_frames?: number;
+      failed_frames?: number;
+      not_testable_frames?: number;
+      testable_frames?: number;
+      overall_result?: string;
+      pass_percentage?: number;
+      earring_accuracy?: number | null;
+      necklace_accuracy?: number | null;
+    };
+    thresholds?: {
+      euclidean_pass?: number;
+      euclidean_warning?: number;
+      euclidean_fail_above?: number;
+      frontal_yaw_deg?: number;
+      earring_pass_band?: { x: number[]; y: number[] };
+      earring_fail_band?: { x: number[]; y: number[] };
+      necklace_pass_band?: { x: number[]; y: number[] };
+      necklace_fail_band?: { x: number[]; y: number[] };
+      angle_pass_points?: Record<string, Record<string, number[]>>;
+    };
+    frames?: Record<string, unknown>[];
   };
   reference_comparison?: {
     status: string;
@@ -178,6 +401,7 @@ export interface QaReport {
   jewelry_type?: string;
   ear_side?: string;
   reference_filename?: string | null;
+  closest_frames?: ClosestFrame[];
   frames: FrameRow[];
   necklace_lay?: {
     status: string;
@@ -276,11 +500,18 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   }
   if (!response.ok) {
     let message = response.statusText;
-    try {
-      const body = await response.json();
-      message = body?.detail?.message || body?.detail || message;
-    } catch {
-      message = await response.text();
+    const raw = await response.text();
+    if (raw) {
+      try {
+        const body = JSON.parse(raw) as { detail?: { message?: string } | string };
+        const detail = body?.detail;
+        message =
+          (typeof detail === "object" && detail?.message) ||
+          (typeof detail === "string" ? detail : null) ||
+          raw;
+      } catch {
+        message = raw;
+      }
     }
     throw new Error(typeof message === "string" ? message : JSON.stringify(message));
   }
@@ -338,6 +569,7 @@ export const api = {
     }),
   status: (id: string) => request<RunStatus>(`/api/v1/tests/${id}/status`),
   results: (id: string) => request<QaReport>(`/api/v1/tests/${id}/results`),
+  frameLandmarks: (url: string) => request<FrameLandmarks>(url),
   runs: () => request<Record<string, unknown>[]>("/api/v1/runs"),
   deleteRun: (runId: string) => request<void>(`/api/v1/runs/${runId}`, { method: "DELETE" }),
   clearHistory: () => request<{ deleted_runs: number }>("/api/v1/history", { method: "DELETE" }),
@@ -347,5 +579,10 @@ export const api = {
       body: JSON.stringify(body),
     }),
   reportUrl: (testId: string) => `${API_URL}/api/v1/tests/${testId}/report`,
-  asset: (path: string | null | undefined) => (path ? `${API_URL}${path}` : ""),
+  asset: (path: string | null | undefined) => {
+    if (!path) return "";
+    if (path.startsWith("http://") || path.startsWith("https://")) return path;
+    // Same-origin path so the dashboard on port 8000 loads the proxied image.
+    return path.startsWith("/") ? path : `${API_URL}/${path}`;
+  },
 };

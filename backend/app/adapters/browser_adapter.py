@@ -178,6 +178,30 @@ class PlaywrightBrowserAdapter(BrowserAdapter):
             "The try-on viewport was not visible, so the advertisement video was not captured."
         )
 
+    async def screenshot_playing(self, path: Path) -> None:
+        """Grab the try-on view without pausing the camera video.
+
+        Element screenshots disable animations and stall the fake-camera file.
+        A page clip with animations left running lets the video keep playing.
+        """
+        path.parent.mkdir(parents=True, exist_ok=True)
+        page = self._require_page()
+        box = await self.tryon_box()
+        kwargs: dict = {"path": str(path), "animations": "allow", "timeout": 5000}
+        if box is not None:
+            kwargs["clip"] = {
+                "x": float(box["x"]),
+                "y": float(box["y"]),
+                "width": float(box["width"]),
+                "height": float(box["height"]),
+            }
+        await page.screenshot(**kwargs)
+
+    async def screenshot_live(self, path: Path) -> None:
+        """One viewport shot for the Step 2 preview. Avoids walking iframes, which stalls the camera video."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        await self._require_page().screenshot(path=str(path), timeout=2500, animations="allow")
+
     async def _tryon_viewport(self):
         page = self._require_page()
         frames = page.locator("iframe")
@@ -208,7 +232,41 @@ class PlaywrightBrowserAdapter(BrowserAdapter):
         return None
 
     async def fill(self, selector: str, value: str) -> None:
-        await self._require_page().fill(selector, value)
+        """Fill a visible input, including React controlled fields used by Amplify DemoGate."""
+        page = self._require_page()
+        locator = page.locator(selector).locator("visible=true").first
+        await locator.wait_for(state="visible", timeout=self.timeout_ms)
+        await locator.click(timeout=self.timeout_ms)
+        if not value:
+            await locator.fill("")
+            return
+        # Set the React value on this exact element. querySelector(selector) can hit a
+        # different text box (a header search field) and leave the login username empty.
+        await self._commit_input_value(locator, value)
+        if await locator.input_value() == value:
+            return
+        await locator.fill("")
+        press_seq = getattr(locator, "press_sequentially", None)
+        if callable(press_seq):
+            await press_seq(value, delay=30)
+        else:
+            await locator.type(value, delay=30, timeout=self.timeout_ms)
+        await self._commit_input_value(locator, value)
+
+    async def _commit_input_value(self, locator, value: str) -> None:
+        await locator.evaluate(
+            """(el, val) => {
+              const proto = el instanceof HTMLTextAreaElement
+                ? window.HTMLTextAreaElement.prototype
+                : window.HTMLInputElement.prototype;
+              const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+              if (desc && desc.set) desc.set.call(el, val);
+              else el.value = val;
+              el.dispatchEvent(new InputEvent('input', { bubbles: true, data: val, inputType: 'insertText' }));
+              el.dispatchEvent(new Event('change', { bubbles: true }));
+            }""",
+            value,
+        )
 
     async def click(self, selector: str) -> None:
         await self._require_page().click(selector)
@@ -231,6 +289,16 @@ class PlaywrightBrowserAdapter(BrowserAdapter):
 
     async def wait_for_timeout(self, milliseconds: int) -> None:
         await self._require_page().wait_for_timeout(milliseconds)
+
+    async def focus(self) -> None:
+        """Bring the try-on window forward so it stays visible after Open try-on."""
+        page = self._page
+        if page is None:
+            return
+        try:
+            await page.bring_to_front()
+        except Exception:
+            return
 
     async def content_text(self) -> str:
         return await self._require_page().inner_text("body")

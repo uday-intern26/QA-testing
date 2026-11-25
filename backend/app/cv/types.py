@@ -26,6 +26,16 @@ class FaceLandmarkResult(BaseModel):
     reason: str | None = None
 
 
+class HandLandmarkResult(BaseModel):
+    hand_detected: bool
+    landmarks: list[Landmark] = Field(default_factory=list)
+    confidence: float = 0.0
+    handedness: str = "unknown"
+    wrist_visible: bool = False
+    fingers_visible: list[str] = Field(default_factory=list)
+    reason: str | None = None
+
+
 class EarlobeAnchor(BaseModel):
     side: str
     x: float
@@ -46,6 +56,10 @@ class EarringAnchor(BaseModel):
     scale: float | None = None
     jewelry_id: str | None = None
     reason: str | None = None
+    # Local as-worn attachment offsets (same space as EARRING_PASS_TRACKING_POINTS).
+    local_x: float | None = None
+    local_y: float | None = None
+    local_z: float | None = None
 
 
 class FrameQuality(BaseModel):
@@ -57,6 +71,20 @@ class FrameQuality(BaseModel):
     head_pose_stable: bool
     occluded: bool = False
     rejection_reasons: list[str] = Field(default_factory=list)
+    # reason -> pipeline stage that produced it, so a duplicate-frame skip is
+    # never read as a jewelry placement failure.
+    rejection_sources: dict[str, str] = Field(default_factory=dict)
+    # Category-aware selection metadata
+    jewelry_category: str = "earring"
+    required_body_parts: list[str] = Field(default_factory=list)
+    detected_body_parts: list[str] = Field(default_factory=list)
+    body_confidence: float = 0.0
+    hand_detected: bool = False
+    neck_visible: bool = False
+    wrist_visible: bool = False
+    fingers_visible: bool = False
+    quality_score: float = 0.0
+    selection_status: str = "pending"
 
 
 class PlacementMeasurement(BaseModel):

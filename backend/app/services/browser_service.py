@@ -14,6 +14,34 @@ from app.models.application import Application
 from app.schemas.application import ApplicationValidateResponse, CatalogCategory, CatalogResponse, CheckItem
 
 
+# The Open try-on button keeps this browser on screen. A later test run replaces it.
+_live_tryon: PlaywrightTryOnAdapter | None = None
+
+
+async def release_live_tryon() -> None:
+    """Close the preview window left open by Open try-on & camera."""
+    global _live_tryon
+    current = _live_tryon
+    _live_tryon = None
+    if current is None:
+        return
+    try:
+        await current.close()
+    except Exception:
+        return
+
+
+async def _hold_live_tryon(adapter: PlaywrightTryOnAdapter) -> None:
+    global _live_tryon
+    previous = _live_tryon
+    _live_tryon = adapter
+    if previous is not None and previous is not adapter:
+        try:
+            await previous.close()
+        except Exception:
+            pass
+
+
 def validate_url(url: str) -> None:
     parsed = urlparse(url.strip())
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -79,6 +107,7 @@ class BrowserService:
         )
         screenshot_dir.mkdir(parents=True, exist_ok=True)
         shot = screenshot_dir / f"{uuid4().hex}.png"
+        await release_live_tryon()
         adapter = PlaywrightTryOnAdapter(
             application,
             username=username,
@@ -94,6 +123,7 @@ class BrowserService:
         reachable = False
         login_ok = False
         loaded = False
+        keep_open = False
         try:
             await adapter.connect()
             reachable = True
@@ -144,6 +174,8 @@ class BrowserService:
                 except Exception:
                     screenshot = None
             log_event("APPLICATION_VALIDATED", url=url, jewelry=len(jewelry))
+            await adapter.browser.focus()
+            keep_open = True
             return ApplicationValidateResponse(
                 status="success",
                 reachable=True,
@@ -181,7 +213,10 @@ class BrowserService:
             log_event("APPLICATION_VALIDATION_FAILED", code="BROWSER", detail=message)
             return _failed(checks, message)
         finally:
-            await adapter.close()
+            if keep_open:
+                await _hold_live_tryon(adapter)
+            else:
+                await adapter.close()
             secret_registry.discard(password)
 
     async def list_catalog(

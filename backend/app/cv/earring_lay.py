@@ -35,13 +35,9 @@ def _accuracy_from_error(error: float, fail_threshold: float) -> float:
 
 
 def _combine(*statuses: str) -> str:
-    if any(status == "FAIL" for status in statuses):
-        return "FAIL"
-    if any(status == "WARNING" for status in statuses):
-        return "WARNING"
-    if statuses and all(status == "PASS" for status in statuses):
-        return "PASS"
-    return "FAIL"
+    from app.cv.tryon_placement_rules import combine_component_statuses
+
+    return combine_component_statuses(statuses)
 
 
 def _face_regions(face: FaceLandmarkResult | None) -> dict[str, tuple[float, float]] | None:
@@ -79,18 +75,19 @@ def _evaluate_side(
     required: bool,
 ) -> dict:
     minimum_confidence = float(config.get("minimum_confidence", 0.80))
-    pass_threshold = float(config.get("pass_threshold", 0.08))
-    fail_threshold = float(config.get("fail_threshold", 0.15))
+    # Spec section 4 defaults: PASS <= 0.02, WARNING <= 0.05, FAIL > 0.05
+    pass_threshold = float(config.get("pass_threshold", 0.02))
+    fail_threshold = float(config.get("fail_threshold", 0.05))
     zone_y_scale = float(config.get("zone_y_scale", 1.0))
 
     checks: dict[str, dict] = {}
 
-    # 1. Ear detection
+    # 1. Ear detection — occluded / missing ear is NOT TESTABLE (not PASS).
     if earlobe is None:
         checks["ear_detection"] = {
-            "status": "FAIL" if required else "WARNING",
+            "status": "NOT_TESTABLE",
             "accuracy": 0.0,
-            "detail": f"{side.capitalize()} ear was not detected from facial landmarks.",
+            "detail": f"{side.capitalize()} ear is not visible / not testable.",
         }
     elif earlobe.confidence < minimum_confidence:
         # Spec: insufficient ear confidence is WARNING (partial / hard conditions)
@@ -112,12 +109,49 @@ def _evaluate_side(
         }
 
     jewelry_ok = bool(jewelry and jewelry.visible and jewelry.x is not None and jewelry.y is not None)
+    if jewelry_ok and jewelry is not None:
+        source = str(jewelry.source or "missing").lower()
+        # Bare-ear pixel guesses must not count as a placed earring.
+        if source in {"blob", "template", "missing"} and float(jewelry.confidence or 0.0) < 0.85:
+            jewelry_ok = False
+    if earlobe is None:
+        not_testable = {
+            "status": "NOT_TESTABLE",
+            "accuracy": 0.0,
+            "detail": f"{side.capitalize()} ear is not visible / not testable.",
+        }
+        for key in (
+            "earring_attachment",
+            "earlobe_alignment",
+            "earring_placement",
+            "hanging_alignment",
+            "stud_alignment",
+            "face_clearance",
+            "earring_distance",
+        ):
+            checks[key] = dict(not_testable)
+        return {
+            "side": side,
+            "status": "NOT_TESTABLE",
+            "checks": {key: value["status"] for key, value in checks.items()},
+            "check_details": checks,
+            "accuracies": {
+                "ear_detection_accuracy": 0.0,
+                "earring_placement_accuracy": 0.0,
+                "earlobe_alignment_accuracy": 0.0,
+                "hanging_alignment_accuracy": 0.0,
+            },
+            "normalized_distance": None,
+            "reason": not_testable["detail"],
+        }
+
     if not jewelry_ok:
-        status = "FAIL" if required else "WARNING"
+        # Ear visible but jewelry missing → detached / FAIL when required.
+        status = "FAIL" if required else "NOT_TESTABLE"
         detail = (
-            f"{side.capitalize()} earring is missing when required."
+            f"{side.capitalize()} earring is not attached to the earlobe."
             if required
-            else f"{side.capitalize()} earring was not detected."
+            else f"{side.capitalize()} earring is not visible / not testable."
         )
         fail = {"status": status, "accuracy": 0.0, "detail": detail}
         for key in (
@@ -148,37 +182,6 @@ def _evaluate_side(
     assert jewelry is not None and jewelry.x is not None and jewelry.y is not None
     jx, jy = float(jewelry.x), float(jewelry.y)
 
-    if earlobe is None:
-        fail = {
-            "status": "FAIL",
-            "accuracy": 0.0,
-            "detail": f"Cannot score {side} earring lay without an ear estimate.",
-        }
-        for key in (
-            "earring_attachment",
-            "earlobe_alignment",
-            "earring_placement",
-            "hanging_alignment",
-            "stud_alignment",
-            "face_clearance",
-            "earring_distance",
-        ):
-            checks[key] = dict(fail)
-        return {
-            "side": side,
-            "status": "FAIL",
-            "checks": {key: value["status"] for key, value in checks.items()},
-            "check_details": checks,
-            "accuracies": {
-                "ear_detection_accuracy": 0.0,
-                "earring_placement_accuracy": 0.0,
-                "earlobe_alignment_accuracy": 0.0,
-                "hanging_alignment_accuracy": 0.0,
-            },
-            "normalized_distance": None,
-            "reason": fail["detail"],
-        }
-
     ear_width = max(0.012, float(earlobe.ear_width))
     dx, dy = offset(jx, jy, earlobe.x, earlobe.y)
     raw = distance(dx, dy)
@@ -189,10 +192,18 @@ def _evaluate_side(
         adj_dy = max(0.0, dy - hang_allowance)
     else:
         adj_dy = dy
+    # Spec section 4: Euclidean error vs landmark-relative attachment (earlobe).
+    # Keep normalized distance for zone overlays; classify with Euclidean thresholds.
+    from app.cv.tryon_placement_rules import classify_euclidean, euclidean_error
+
+    euclid = euclidean_error(earlobe.x, earlobe.y, jx, jy)
+    hang_adjusted_euclid = distance(dx, adj_dy)
     normalized = normalize_distance(dx, adj_dy, ear_width, zone_y_scale)
+    # Prefer hang-adjusted Euclidean so natural drops are not false FAIL.
+    score_error = hang_adjusted_euclid if hang_adjusted_euclid <= euclid else euclid
 
     # Hard FAIL zones relative to the ear
-    floating = normalized > fail_threshold and (abs(dx) > 0.35 * ear_width or dy < -0.2 * ear_width)
+    floating = score_error > fail_threshold and (abs(dx) > 0.35 * ear_width or dy < -0.2 * ear_width)
     # Cheek: inward toward face midline
     face_mid_x = 0.5
     regions = _face_regions(face)
@@ -203,7 +214,7 @@ def _evaluate_side(
         toward_face = jx > earlobe.x + 0.55 * ear_width
     else:
         toward_face = jx < earlobe.x - 0.55 * ear_width
-    on_cheek = toward_face and abs(jy - earlobe.y) < 1.2 * ear_width and normalized > pass_threshold
+    on_cheek = toward_face and abs(jy - earlobe.y) < 1.2 * ear_width and score_error > pass_threshold
     on_neck = jy > earlobe.y + 2.2 * ear_width
     wrong_side = (side == "left" and jx > face_mid_x + 0.02) or (side == "right" and jx < face_mid_x - 0.02)
 
@@ -227,9 +238,9 @@ def _evaluate_side(
     # 2. Earring attachment to correct ear
     attachment_status = "PASS"
     attachment_detail = f"{side.capitalize()} earring is attached to the correct ear."
-    if wrong_side and normalized > pass_threshold:
+    if wrong_side and score_error > pass_threshold:
         attachment_status = "FAIL"
-        attachment_detail = f"{side.capitalize()} earring is attached to the wrong location."
+        attachment_detail = "Left and right earrings are incorrectly swapped."
     elif on_cheek:
         attachment_status = "FAIL"
         attachment_detail = f"{side.capitalize()} earring is positioned on the cheek."
@@ -238,26 +249,26 @@ def _evaluate_side(
         attachment_detail = f"{side.capitalize()} earring is positioned on the neck."
     elif floating:
         attachment_status = "FAIL"
-        attachment_detail = f"{side.capitalize()} earring is floating away from the ear."
-    elif normalized > fail_threshold:
+        attachment_detail = f"{side.capitalize()} earring floats away from the ear."
+    elif score_error > fail_threshold:
         attachment_status = "FAIL"
-        attachment_detail = f"{side.capitalize()} earring placement error exceeds the fail threshold."
-    elif normalized > pass_threshold:
+        attachment_detail = f"{side.capitalize()} earring placement error exceeds {fail_threshold:.2f}."
+    elif score_error > pass_threshold:
         attachment_status = "WARNING"
         attachment_detail = f"{side.capitalize()} earring is slightly misaligned with the ear."
     checks["earring_attachment"] = {
         "status": attachment_status,
-        "accuracy": _accuracy_from_error(normalized, fail_threshold),
+        "accuracy": _accuracy_from_error(score_error, fail_threshold),
         "detail": attachment_detail,
     }
 
-    # 3. Earlobe / piercing alignment
-    earlobe_status = _status_from_error(normalized, pass_threshold, fail_threshold)
+    # 3. Earlobe / piercing alignment (Euclidean)
+    earlobe_status = classify_euclidean(score_error, pass_threshold=pass_threshold, fail_threshold=fail_threshold)
     if on_cheek or on_neck or floating:
         earlobe_status = "FAIL"
     checks["earlobe_alignment"] = {
         "status": earlobe_status,
-        "accuracy": _accuracy_from_error(normalized, fail_threshold),
+        "accuracy": _accuracy_from_error(score_error, fail_threshold),
         "detail": (
             f"{side.capitalize()} earring aligns with the intended piercing / earlobe."
             if earlobe_status == "PASS"
@@ -265,20 +276,56 @@ def _evaluate_side(
             if earlobe_status == "FAIL"
             else f"{side.capitalize()} earring is slightly off the piercing point."
         ),
-        "error": normalized,
+        "error": score_error,
     }
 
-    # 4/5. Side placement
-    placement_status = _combine(attachment_status, earlobe_status, checks["face_clearance"]["status"])
+    # 4/5. Side placement — PASS only when fed pass-tracking offsets match.
+    from app.cv.tryon_placement_rules import (
+        EARRING_PASS_TRACKING_TOLERANCE,
+        classify_tracking_error,
+        earring_pass_tracking,
+        tracking_offset_error,
+    )
+
+    tracking = earring_pass_tracking(side)
+    track_err = tracking_offset_error(jewelry.local_x, jewelry.local_y, jewelry.local_z, side)
+    tracking_status = classify_tracking_error(track_err)
+    if track_err is None:
+        tracking_status = "FAIL"
+        tracking_detail = (
+            f"{side.capitalize()} earring pass tracking offsets were not reported; "
+            f"PASS requires ({tracking['x']}, {tracking['y']}, {tracking['z']})."
+        )
+    elif tracking_status == "PASS":
+        tracking_detail = (
+            f"{side.capitalize()} earring is on the pass tracking point "
+            f"({tracking['x']}, {tracking['y']}, {tracking['z']})."
+        )
+    else:
+        tracking_detail = (
+            f"{side.capitalize()} earring is off the pass tracking point "
+            f"(error {track_err:.2f}; pass ≤ {EARRING_PASS_TRACKING_TOLERANCE})."
+        )
+    checks["pass_tracking"] = {
+        "status": tracking_status,
+        "accuracy": 1.0 if tracking_status == "PASS" else 0.0,
+        "detail": tracking_detail,
+        "error": track_err,
+    }
+
+    placement_status = _combine(
+        attachment_status, earlobe_status, checks["face_clearance"]["status"], tracking_status
+    )
     checks["earring_placement"] = {
         "status": placement_status,
-        "accuracy": _accuracy_from_error(normalized, fail_threshold),
+        "accuracy": _accuracy_from_error(score_error, fail_threshold),
         "detail": (
-            f"{side.capitalize()} earring is positioned correctly."
+            tracking_detail
             if placement_status == "PASS"
-            else attachment_detail
+            else (tracking_detail if tracking_status != "PASS" else attachment_detail)
         ),
         "normalized_distance": normalized,
+        "euclidean_error": score_error,
     }
 
     # 7. Hanging alignment — drops/danglers should fall downward from attachment (dy >= 0 in image space)
@@ -308,9 +355,9 @@ def _evaluate_side(
     }
 
     # 8. Stud alignment — tight to piercing when scale suggests stud / small displacement
-    is_likely_stud = (jewelry.scale is not None and float(jewelry.scale) < 1.15) or normalized <= pass_threshold * 1.5
+    is_likely_stud = (jewelry.scale is not None and float(jewelry.scale) < 1.15) or score_error <= pass_threshold * 1.5
     if is_likely_stud:
-        stud_status = _status_from_error(normalized, pass_threshold, fail_threshold)
+        stud_status = classify_euclidean(score_error, pass_threshold=pass_threshold, fail_threshold=fail_threshold)
         stud_detail = (
             f"{side.capitalize()} stud sits on the intended piercing point."
             if stud_status == "PASS"
@@ -322,17 +369,18 @@ def _evaluate_side(
         stud_detail = f"{side.capitalize()} piece treated as hoop/drop/dangler; piercing check uses earlobe alignment."
     checks["stud_alignment"] = {
         "status": stud_status,
-        "accuracy": _accuracy_from_error(normalized, fail_threshold),
+        "accuracy": _accuracy_from_error(score_error, fail_threshold),
         "detail": stud_detail,
     }
 
-    # 10. Earring distance
-    distance_status = _status_from_error(normalized, pass_threshold, fail_threshold)
+    # 10. Earring distance (Euclidean)
+    distance_status = classify_euclidean(score_error, pass_threshold=pass_threshold, fail_threshold=fail_threshold)
     checks["earring_distance"] = {
         "status": distance_status,
-        "accuracy": _accuracy_from_error(normalized, fail_threshold),
-        "detail": f"Normalized {side} earring-to-earlobe distance is {normalized:.3f}.",
+        "accuracy": _accuracy_from_error(score_error, fail_threshold),
+        "detail": f"Euclidean {side} earring-to-earlobe error is {score_error:.3f} (pass ≤ {pass_threshold:.2f}).",
         "normalized_distance": normalized,
+        "euclidean_error": score_error,
         "raw_distance": raw,
         "ear_width": ear_width,
     }

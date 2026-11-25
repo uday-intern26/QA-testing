@@ -1,4 +1,5 @@
 import { QaReport } from "@/lib/api";
+import { PlacementValidationPanel } from "./PlacementValidationPanel";
 import { StatusBadge } from "./StatusBadge";
 import { TestLayers, layerStatus } from "./TestLayers";
 
@@ -15,26 +16,34 @@ export function ResultSummary({ report }: { report: QaReport }) {
       <div className="grid gap-2 text-sm text-zinc-400 md:grid-cols-2">
         <p>Application: {report.application?.url || report.application?.name || "n/a"}</p>
         <p>
-          Jewellery: {report.jewelry_id || "unspecified"} · {report.ear_side?.toUpperCase() || "n/a"}
+          Jewellery: {report.jewelry_type || "n/a"} · {report.jewelry_id || "unspecified"} ·{" "}
+          {report.ear_side?.toUpperCase() || "n/a"}
         </p>
         <p>Run: {report.test_run_id}</p>
+        {stats?.required_body_parts?.length ? (
+          <p>Required body: {stats.required_body_parts.join(", ")}</p>
+        ) : null}
       </div>
       <div className="rounded-lg border border-zinc-800 bg-zinc-950 p-6 text-center">
         <p className="text-xs uppercase tracking-[0.2em] text-zinc-500">Overall result</p>
         <div className="mt-3 flex justify-center">
           <StatusBadge status={report.overall_status} />
         </div>
-        <div className="mt-6 grid grid-cols-2 gap-4 text-sm md:grid-cols-4">
-          <Metric label="Pass rate" value={stats ? `${(stats.pass_rate * 100).toFixed(1)}%` : "n/a"} />
-          <Metric label="Frames tested" value={String(stats?.frames_selected ?? 0)} />
+        <div className="mt-6 grid grid-cols-3 gap-4 text-sm">
+          <Metric
+            label="Pass rate"
+            value={
+              stats
+                ? `${(stats.pass_percentage ?? stats.pass_rate * 100).toFixed(1)}%`
+                : "n/a"
+            }
+          />
           <Metric label="Passed" value={String(stats?.frames_passed ?? 0)} />
           <Metric label="Failed" value={String(stats?.frames_failed ?? 0)} />
         </div>
         {report.reason ? <p className="mt-4 text-sm text-zinc-300">{report.reason}</p> : null}
-        {report.recommended_action ? (
-          <p className="mt-2 text-sm text-zinc-500">Recommended action: {report.recommended_action}</p>
-        ) : null}
       </div>
+      <PlacementValidationPanel report={report} />
       <div>
         <p className="mb-3 text-xs uppercase tracking-[0.2em] text-zinc-500">Three-layer validation</p>
         <TestLayers
@@ -46,7 +55,7 @@ export function ResultSummary({ report }: { report: QaReport }) {
               detail: frameLayer.detail,
             },
             {
-              title: "Layer 2 — Earlobe + Earring Anchor Detection",
+              title: "Layer 2 — Body + Jewelry Anchor Detection",
               subtitle: "Locate both points",
               status: anchorLayer.status,
               detail: anchorLayer.detail,
@@ -60,6 +69,40 @@ export function ResultSummary({ report }: { report: QaReport }) {
           ]}
         />
       </div>
+      <div className="rounded-lg border border-zinc-800 p-4 text-sm">
+        <h3 className="font-medium text-zinc-200">Capture status</h3>
+        <div className="mt-3 grid grid-cols-2 gap-3 md:grid-cols-4">
+          <Metric label="Frames captured" value={String(stats?.frames_captured ?? 0)} />
+          <Metric label="Minimum required" value={String(stats?.minimum_required_frames ?? 30)} />
+          <Metric label="Usable frames" value={String(stats?.frames_usable ?? stats?.frames_analyzed ?? 0)} />
+          <Metric label="Rejected frames" value={String(stats?.frames_rejected ?? 0)} />
+        </div>
+        <p className="mt-3 text-zinc-500">
+          Counts start after the jewelry is placed. Target {stats?.target_frames ?? 40} frames. Passing thresholds are unchanged.
+        </p>
+      </div>
+      {report.closest_frames && report.closest_frames.length > 0 ? (
+        <div className="rounded-lg border border-zinc-800 p-4 text-sm">
+          <h3 className="font-medium text-zinc-200">Frames closest to pass</h3>
+          <p className="mt-1 text-xs text-zinc-500">
+            Near pass is a review label. The PASS or FAIL result on each frame stays the measured result.
+          </p>
+          <div className="mt-3 space-y-2">
+            {report.closest_frames.map((frame) => (
+              <div key={`${frame.frame_number}-${frame.review_label}`} className="flex flex-wrap items-center justify-between gap-2 rounded border border-zinc-800 px-3 py-2">
+                <span className="text-zinc-200">
+                  Frame {frame.frame_number} · {frame.review_label === "NEAR_PASS" ? "Near pass" : frame.review_label}
+                </span>
+                <span className="text-zinc-400">
+                  Measured {frame.normalized_distance?.toFixed(3) ?? "n/a"} · threshold {frame.pass_threshold.toFixed(3)} · gap{" "}
+                  {frame.placement_gap?.toFixed(3) ?? "n/a"}
+                </span>
+                <StatusBadge status={frame.status} />
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
       {reference && reference.status !== "NOT_RUN" ? (
         <div className="rounded-lg border border-zinc-800 p-4 text-sm">
           <div className="flex items-center justify-between">
@@ -292,24 +335,22 @@ export function ResultSummary({ report }: { report: QaReport }) {
         <div className="rounded-lg border border-zinc-800 p-4 text-sm">
           <h3 className="mb-3 font-medium text-zinc-200">Temporal stability</h3>
           {temporalEntries.map(([side, summary]) => (
-            <div key={side} className="mb-3 last:mb-0">
-              <div className="flex items-center justify-between">
-                <p className="capitalize text-zinc-300">{side} {report.jewelry_type === "necklace" ? "neck" : "ear"}</p>
-                <StatusBadge status={summary.status} />
-              </div>
-              <p className="mt-1 text-zinc-400">
-                Pass rate {(summary.pass_rate * 100).toFixed(1)}% · Max consecutive failures {summary.max_consecutive_failures}{" "}
-                · Allowed {report.thresholds.maximum_consecutive_failures}
+            <div key={side} className="mb-3 flex items-center justify-between last:mb-0">
+              <p className="capitalize text-zinc-300">
+                {side}{" "}
+                {report.jewelry_type === "necklace"
+                  ? "neck"
+                  : report.jewelry_type === "earring"
+                    ? "ear"
+                    : report.jewelry_type === "ring"
+                      ? "hand"
+                      : "wrist"}
               </p>
-              <p className="text-zinc-500">{summary.reason}</p>
+              <StatusBadge status={summary.status} />
             </div>
           ))}
         </div>
       ) : null}
-      <p className="text-xs text-zinc-500">
-        Captured {stats?.frames_captured ?? 0} · Analyzed {stats?.frames_analyzed ?? 0} · Selected {stats?.frames_selected ?? 0} ·
-        Warnings {stats?.frames_warning ?? 0} · Max consecutive failures {stats?.max_consecutive_failures ?? 0}
-      </p>
     </div>
   );
 }

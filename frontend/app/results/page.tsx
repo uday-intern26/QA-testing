@@ -70,7 +70,11 @@ export default function ResultsPage() {
         {finished.map((run) => (
           <li key={String(run.test_run_id)} className="rounded border border-zinc-800 p-4">
             <div className="flex items-center justify-between gap-3">
-              <Link className="underline" href={`/tests/${run.test_id}`}>
+              <Link
+                className="font-medium text-zinc-100 underline decoration-zinc-600 hover:decoration-zinc-200"
+                href={`/tests/${encodeURIComponent(String(run.test_id))}`}
+                title="Open results"
+              >
                 {run.test_name}
               </Link>
               <div className="flex items-center gap-3">

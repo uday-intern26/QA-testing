@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -12,8 +12,8 @@ class TestCreate(BaseModel):
     jewelry_type: Literal["earring", "necklace", "bracelet", "ring", "bangle"] = "earring"
     ear_side: Literal["left", "right", "both"] = "left"
     selected_finger: Literal["thumb", "index", "middle", "ring", "little"] | None = "ring"
-    capture_fps: Literal[1, 2, 5, 10] = 5
-    capture_duration_seconds: float = Field(default=6, ge=1, le=60)
+    capture_fps: Literal[1, 2, 5, 10, 15, 30] = 10
+    capture_duration_seconds: float = Field(default=1, ge=1, le=180)
     minimum_confidence: float = Field(default=0.80, ge=0, le=1)
     pass_threshold: float = Field(default=0.10, ge=0, le=2)
     fail_threshold: float = Field(default=0.15, ge=0, le=2)
@@ -21,7 +21,10 @@ class TestCreate(BaseModel):
     maximum_consecutive_failures: int = Field(default=2, ge=0, le=100)
     zone_y_scale: float = Field(default=1.0, gt=0, le=3)
     min_selected_frames: int = Field(default=5, ge=1, le=200)
-    max_selected_frames: int = Field(default=30, ge=1, le=300)
+    max_selected_frames: int = Field(default=10, ge=1, le=300)
+    debug_mode: bool = False
+    # Per-category overrides for landmark debug tolerances and display toggles.
+    debug_options: dict[str, Any] | None = None
 
 
 class TestRead(TestCreate):
@@ -32,7 +35,7 @@ class TestRead(TestCreate):
 class TestRunRequest(BaseModel):
     username: str | None = None
     password: str | None = None
-    capture_duration_seconds: float | None = Field(default=None, ge=1, le=60)
+    capture_duration_seconds: float | None = Field(default=None, ge=1, le=180)
 
 
 class TestRunAccepted(BaseModel):
